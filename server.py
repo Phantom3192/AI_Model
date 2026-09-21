@@ -24,6 +24,11 @@ Keep it at ONE worker process: the feature bank lives in this process's memory.
 
 import io
 import os
+import math
+import hashlib
+import urllib.error
+import urllib.parse
+import urllib.request
 import re
 import sys
 import time
@@ -41,6 +46,20 @@ from typing import Deque, List, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
+
+try:  # optional: keep-alive connections for fetching images; falls back to urllib in a thread without it
+    import aiohttp
+except ImportError:
+    aiohttp = None
+
+# Pin BLAS/OpenMP to ONE thread in this process. The cosine match (`matrix @ vec`) is a BLAS call, and by
+# default every concurrent request spins up (and busy-waits) a thread per host core: it burns CPU and
+# slows the real work. Parallelism here comes from INFER_CONCURRENCY slots instead. Child processes
+# (training / ONNX export) get the original values back, see child_env().
+_BLAS_VARS = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
+_BLAS_ORIG = {k: os.environ.get(k) for k in _BLAS_VARS}
+for _k in _BLAS_VARS:
+    os.environ[_k] = "1"
 
 import numpy as np
 from PIL import Image
@@ -109,8 +128,40 @@ def child_env(**extra) -> dict:
     for k in _CHILD_TUNABLES:
         if k in env:
             env[k] = _env(k)
+    for k, v in _BLAS_ORIG.items():  # training/export should keep their own thread settings
+        if v is None:
+            env.pop(k, None)
+        else:
+            env[k] = v
     env.update(extra)
     return env
+
+
+def _detect_cores() -> int:
+    """CPU cores this container may actually use (cgroup quota first: the host's core count is misleading)."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:  # cgroup v2: "<quota> <period>" or "max <period>"
+            quota, period = f.read().split()[:2]
+        if quota != "max":
+            return max(1, math.ceil(int(quota) / int(period)))
+    except Exception:
+        pass
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:  # cgroup v1
+            quota = int(f.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+            period = int(f.read())
+        if quota > 0:
+            return max(1, math.ceil(quota / period))
+    except Exception:
+        pass
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except Exception:
+        return max(1, os.cpu_count() or 1)
+
+
+CORES = min(_detect_cores(), 16)
 
 
 @dataclass
@@ -119,14 +170,16 @@ class Settings:
     model_path: str = field(default_factory=lambda: _env("MODEL_OUTPUT", "models/pokemon_classifier.pt"))
     onnx_path: str = field(default_factory=lambda: _env("ONNX_MODEL_PATH"))
     auto_export_onnx: bool = field(default_factory=lambda: _env_bool("AUTO_EXPORT_ONNX", True))
-    onnx_threads: int = field(default_factory=lambda: max(1, _env_int("ONNX_THREADS", 1)))
-    infer_concurrency: int = field(default_factory=lambda: max(1, _env_int("INFER_CONCURRENCY", 2)))
+    onnx_threads: int = CORES                 # model threads: one lone spawn can use every core
+    infer_concurrency: int = CORES * 8        # parallel inference slots: bursts keep every core busy
+    max_pending: int = CORES * 128            # images allowed to wait for a slot; beyond that -> 503 "busy" (protects RAM)
+    infer_chunk: int = 2
     top_k: int = field(default_factory=lambda: max(1, _env_int("TOP_K", 5)))
     near_exact_sim: float = field(default_factory=lambda: _env_float("NEAR_EXACT_SIM", 0.95))
     learn_dup_sim: float = field(default_factory=lambda: _env_float("LEARN_DUP_SIM", 0.995))
     confidence_threshold: float = field(default_factory=lambda: _env_float("CONFIDENCE_THRESHOLD", 0.5))
-    max_upload_mb: float = field(default_factory=lambda: _env_float("MAX_UPLOAD_MB", 10.0))
-    max_batch: int = field(default_factory=lambda: max(1, _env_int("MAX_BATCH", 32)))
+    max_upload_mb: float = 10.0
+    max_batch: int = 32
     export_timeout_s: int = field(default_factory=lambda: _env_int("EXPORT_TIMEOUT_S", 900))
     trainer_cmd: List[str] = field(default_factory=lambda: [sys.executable, "-u", "run_training.py"])
     train_log: str = field(default_factory=lambda: _env("TRAIN_LOG", "train.log"))
@@ -334,6 +387,20 @@ class Engine:
         return {"n": len(v), "p50": round(float(np.percentile(v, 50)), 2),
                 "p95": round(float(np.percentile(v, 95)), 2)}
 
+    def _bank_fingerprint(self, species, matrix, version) -> str:
+        """Content hash of model + feature bank, so a client can tell if its saved results are still valid
+        (unlike bank_version, it survives server restarts). Computed once per bank version."""
+        cached = getattr(self, "_fp_cache", None)
+        if cached and cached[0] == version:
+            return cached[1]
+        h = hashlib.sha1()
+        h.update(str(self.model_id).encode())
+        h.update("\n".join(species).encode())
+        h.update(np.ascontiguousarray(matrix).tobytes())
+        fp = h.hexdigest()[:16]
+        self._fp_cache = (version, fp)
+        return fp
+
     def health(self) -> dict:
         species, matrix, version = ([], np.zeros((0, 0)), 0)
         if self.bank is not None:
@@ -348,6 +415,7 @@ class Engine:
             "vectors": int(matrix.shape[0]),
             "species": len(set(species)),
             "bank_version": version,
+            "bank_fingerprint": self._bank_fingerprint(species, matrix, version) if len(species) else None,
             "bank_backend": self.bank.backend if self.bank else None,
             "uptime_s": int(time.time() - self.started_at),
         }
@@ -467,6 +535,104 @@ class ForgetBody(BaseModel):
     last: bool = False
 
 
+class UrlsBody(BaseModel):
+    urls: List[str]
+
+
+# ============================================================ server-side image fetching
+# The bot can send image URLs instead of image bytes; the server downloads them itself (much shorter
+# trip than bot -> download -> upload). Only these hosts are fetched, so the endpoint can't be used to
+# make this server request arbitrary addresses. Add more with EXTRA_IMAGE_HOSTS=host1,host2 in .env.
+_IMAGE_HOST_SUFFIXES = (".discordapp.com", ".discordapp.net", ".discord.com", ".poketwo.net")
+_EXTRA_IMAGE_HOSTS = tuple(h.strip().lower() for h in _env("EXTRA_IMAGE_HOSTS").split(",") if h.strip())
+_FETCH_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AI_Model/1.0)", "Accept": "image/*,*/*;q=0.8"}
+_FETCH_TIMEOUT_S = 8.0
+
+
+class FetchError(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _check_image_url(url: str) -> None:
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        raise FetchError("bad_url", "not a valid URL")
+    if parts.scheme not in ("https", "http") or not host or parts.username or parts.password:
+        raise FetchError("bad_url", "only plain http(s) URLs are accepted")
+    ok = host in _EXTRA_IMAGE_HOSTS or any(host == suf[1:] or host.endswith(suf) for suf in _IMAGE_HOST_SUFFIXES)
+    if not ok:
+        raise FetchError("host_not_allowed", f"host not allowed: {host}")
+
+
+_fetch_session = None
+
+
+async def _get_fetch_session():
+    global _fetch_session
+    if _fetch_session is None or _fetch_session.closed:
+        _fetch_session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ttl_dns_cache=300, keepalive_timeout=60, limit=64),
+            headers=_FETCH_HEADERS)
+    return _fetch_session
+
+
+async def _close_fetch_session():
+    global _fetch_session
+    if _fetch_session is not None and not _fetch_session.closed:
+        await _fetch_session.close()
+    _fetch_session = None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _fetch_sync(url: str, limit: int) -> bytes:
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(url, headers=_FETCH_HEADERS)
+    try:
+        with opener.open(req, timeout=_FETCH_TIMEOUT_S) as r:
+            data = r.read(limit + 1)
+    except urllib.error.HTTPError as e:
+        raise FetchError("fetch_failed", f"HTTP {e.code}")
+    except Exception as e:
+        raise FetchError("fetch_failed", f"{type(e).__name__}: {e}")
+    if len(data) > limit:
+        raise FetchError("too_large", "image too large")
+    return data
+
+
+async def fetch_image(url: str, limit: int) -> bytes:
+    """Download one allowed image URL (no redirects, size-capped). Raises FetchError."""
+    _check_image_url(url)
+    if aiohttp is None:
+        return await run_in_threadpool(_fetch_sync, url, limit)
+    try:
+        sess = await _get_fetch_session()
+        timeout = aiohttp.ClientTimeout(total=_FETCH_TIMEOUT_S, connect=4)
+        async with sess.get(url, allow_redirects=False, timeout=timeout) as r:
+            if r.status != 200:
+                raise FetchError("fetch_failed", f"HTTP {r.status}")
+            if r.content_length and r.content_length > limit:
+                raise FetchError("too_large", "image too large")
+            buf = bytearray()
+            async for chunk in r.content.iter_chunked(65536):
+                buf.extend(chunk)
+                if len(buf) > limit:
+                    raise FetchError("too_large", "image too large")
+            return bytes(buf)
+    except FetchError:
+        raise
+    except Exception as e:
+        raise FetchError("fetch_failed", f"{type(e).__name__}: {e}")
+
+
 # ============================================================ app factory
 def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] = None) -> FastAPI:
     s = settings or Settings()
@@ -476,6 +642,8 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] 
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        log.info(f"CPU cores={CORES}, onnx_threads={s.onnx_threads}, infer_slots={s.infer_concurrency}, "
+                 f"max_pending={s.max_pending}")
         if not s.api_key:
             log.warning("API_KEY is not set: the API is OPEN to anyone who can reach it and /admin/* is disabled.")
 
@@ -488,6 +656,7 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] 
         task = asyncio.create_task(_initial_load())
         yield
         task.cancel()
+        await _close_fetch_session()
         trainer.stop()
         if engine.bank is not None:
             engine.bank.close()
@@ -527,6 +696,19 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] 
             raise HTTPException(400, "empty file")
         return data
 
+    pending = {"n": 0}
+
+    @asynccontextmanager
+    async def admitted(n: int):
+        """Load shedding: refuse new work instead of queueing without limit (RAM / latency blow-up)."""
+        if pending["n"] + n > s.max_pending:
+            raise HTTPException(503, "busy - too many images queued, retry shortly")
+        pending["n"] += n
+        try:
+            yield
+        finally:
+            pending["n"] -= n
+
     async def infer(fn, *args):
         async with infer_sem:
             return await run_in_threadpool(fn, *args)
@@ -558,7 +740,8 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] 
         require_ready()
         data = await read_upload(file)
         try:
-            results = await infer(engine.identify, [data])
+            async with admitted(1):
+                results = await infer(engine.identify, [data])
         except EmptyBank:
             raise HTTPException(503, "the feature bank is empty - train first (POST /admin/train)")
         if results[0] is None:
@@ -573,9 +756,14 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] 
         require_ready()
         if len(files) > s.max_batch:
             raise HTTPException(413, f"at most {s.max_batch} images per batch")
-        blobs = [await read_upload(f) for f in files]
+        blobs = list(await asyncio.gather(*(read_upload(f) for f in files)))
+        # Fan the batch out over all inference slots instead of running it on one thread:
+        # chunks of INFER_CHUNK images run in parallel, results stay in input order.
+        chunks = [blobs[i:i + s.infer_chunk] for i in range(0, len(blobs), s.infer_chunk)]
         try:
-            results = await infer(engine.identify, blobs)
+            async with admitted(len(blobs)):
+                parts = await asyncio.gather(*(infer(engine.identify, c) for c in chunks))
+            results = [r for part in parts for r in part]
         except EmptyBank:
             raise HTTPException(503, "the feature bank is empty - train first (POST /admin/train)")
         th = s.confidence_threshold if threshold is None else threshold
@@ -584,6 +772,52 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] 
             else {"ok": True, **public(r, th, include_embedding)}
             for r in results
         ]}
+
+    @app.post("/v1/predict/urls", dependencies=[Depends(require_key)])
+    async def predict_urls(body: UrlsBody,
+                           threshold: Optional[float] = Query(None, ge=0.0, le=1.0),
+                           include_embedding: bool = Query(False)):
+        """Same as /v1/predict/batch, but the server downloads the images from the given URLs."""
+        require_ready()
+        urls = body.urls
+        if not urls:
+            raise HTTPException(422, "urls must not be empty")
+        if len(urls) > s.max_batch:
+            raise HTTPException(413, f"at most {s.max_batch} urls per request")
+        th = s.confidence_threshold if threshold is None else threshold
+
+        async def fetch_one(u: str):
+            t = time.perf_counter()
+            try:
+                data = await fetch_image(u, s.max_upload_bytes)
+                return data, None, (time.perf_counter() - t) * 1000
+            except FetchError as e:
+                return None, e, (time.perf_counter() - t) * 1000
+
+        out: List[Optional[dict]] = [None] * len(urls)
+        async with admitted(len(urls)):
+            fetched = await asyncio.gather(*(fetch_one(u) for u in urls))
+            good = []  # (index, bytes, fetch_ms)
+            for i, (data, err, ms) in enumerate(fetched):
+                if err is not None:
+                    out[i] = {"ok": False, "code": err.code, "error": err.message}
+                else:
+                    good.append((i, data, ms))
+            if good:
+                blobs = [g[1] for g in good]
+                chunks = [blobs[i:i + s.infer_chunk] for i in range(0, len(blobs), s.infer_chunk)]
+                try:
+                    parts = await asyncio.gather(*(infer(engine.identify, c) for c in chunks))
+                except EmptyBank:
+                    raise HTTPException(503, "the feature bank is empty - train first (POST /admin/train)")
+                results = [r for part in parts for r in part]
+                for (i, data, ms), r in zip(good, results):
+                    if r is None:
+                        out[i] = {"ok": False, "code": "unreadable", "error": "could not read that image"}
+                    else:
+                        out[i] = {"ok": True, **public(r, th, include_embedding),
+                                  "sha1": hashlib.sha1(data).hexdigest(), "fetch_ms": round(ms, 1)}
+        return {"results": out}
 
     @app.post("/v1/learn", dependencies=[Depends(require_key)])
     async def learn(species: str = Form(...),
@@ -640,7 +874,8 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] 
             body["learned_vectors"] = await run_in_threadpool(engine.bank.count_learned)
         body["settings"] = {"top_k": s.top_k, "confidence_threshold": s.confidence_threshold,
                             "near_exact_sim": s.near_exact_sim, "learn_dup_sim": s.learn_dup_sim,
-                            "onnx_threads": s.onnx_threads, "infer_concurrency": s.infer_concurrency}
+                            "onnx_threads": s.onnx_threads, "infer_concurrency": s.infer_concurrency, "infer_chunk": s.infer_chunk,
+                            "cpu_cores": CORES, "pending_images": pending["n"], "max_pending": s.max_pending}
         body["counters"] = {"predictions": engine.n_predictions, "unreadable_images": engine.n_bad_images}
         body["latency_ms"] = {"embed_per_image": engine._pcts(engine.m_embed), "match": engine._pcts(engine.m_match)}
         return body
@@ -677,4 +912,4 @@ app = create_app()
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host=_env("HOST", "0.0.0.0"), port=_env_int("PORT", 8000), log_level="info",
-                timeout_keep_alive=_env_int("KEEPALIVE_S", 75))
+                timeout_keep_alive=75)
