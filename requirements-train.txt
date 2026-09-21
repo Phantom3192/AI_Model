@@ -1,0 +1,12 @@
+# Only needed on the machine that TRAINS or (re-)EXPORTS the model
+# (POST /admin/train, run_training.py, export_onnx.py). Not needed just to serve.
+-r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+torchvision>=0.15.0
+tqdm>=4.65.0
+datasets>=2.14.0
+huggingface_hub>=0.24.0
+onnx>=1.15.0
+rarfile>=4.0
+py7zr>=0.20.0

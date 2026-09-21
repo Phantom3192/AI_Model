@@ -1,0 +1,9 @@
+# Serving the API needs only this (no torch): inference runs on ONNX Runtime.
+fastapi>=0.110.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9
+numpy>=1.24.0
+Pillow>=10.0.0
+onnxruntime>=1.17.0
+python-dotenv>=1.0.0
+libsql>=0.1.0

@@ -1,0 +1,9 @@
+.env
+image_cache/
+pokemon.db
+__pycache__/
+*.pyc
+.pytest_cache/
+train.log
+# extracted at training time from "Extra pokemons.zip" - keep the ZIP itself committed
+Extra pokemons/
