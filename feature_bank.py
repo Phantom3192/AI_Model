@@ -38,12 +38,18 @@ def new_species_name(name: str) -> str:
     return re.sub(r"\s+", "_", name.strip().lower())
 
 
+def _env(name: str, default: str = "") -> str:
+    """os.getenv minus a trailing "  # comment" (some launchers load .env without stripping them)."""
+    v = os.getenv(name)
+    return default if v is None else re.split(r"\s+#", v, maxsplit=1)[0].strip()
+
+
 class FeatureBank:
     def __init__(self, turso_url: Optional[str] = None, turso_token: Optional[str] = None,
                  db_path: Optional[str] = None):
-        self.turso_url = turso_url if turso_url is not None else os.getenv("TURSO_URL")
-        self.turso_token = turso_token if turso_token is not None else os.getenv("TURSO_AUTH_TOKEN")
-        self.db_path = db_path or os.getenv("DB_PATH", "pokemon.db")
+        self.turso_url = turso_url if turso_url is not None else _env("TURSO_URL")
+        self.turso_token = turso_token if turso_token is not None else _env("TURSO_AUTH_TOKEN")
+        self.db_path = db_path or _env("DB_PATH", "pokemon.db")
         self.backend = "sqlite"
 
         self.version = 0                      # bumped whenever the in-memory bank changes
