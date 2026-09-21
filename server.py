@@ -24,6 +24,7 @@ Keep it at ONE worker process: the feature bank lives in this process's memory.
 
 import io
 import os
+import re
 import sys
 import time
 import json
@@ -62,27 +63,73 @@ if not log.handlers:
 
 
 # ============================================================ settings
+def _env(name: str, default: str = "") -> str:
+    """
+    os.getenv minus any trailing "  # comment". python-dotenv strips those itself, but some panels and
+    launchers load .env without doing so, which used to turn `ONNX_THREADS=1   # note` into a crash.
+    """
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return re.split(r"\s+#", v, maxsplit=1)[0].strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    v = _env(name, str(default))
+    try:
+        return int(v)
+    except ValueError:
+        raise ValueError(f"{name} must be a whole number, got {v!r}") from None
+
+
+def _env_float(name: str, default: float) -> float:
+    v = _env(name, str(default))
+    try:
+        return float(v)
+    except ValueError:
+        raise ValueError(f"{name} must be a number, got {v!r}") from None
+
+
 def _env_bool(name: str, default: bool) -> bool:
-    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+    return _env(name, str(default)).lower() in ("1", "true", "yes", "on")
+
+
+# Settings that train_model.py / export_onnx.py read with a bare int()/float() on os.environ.
+# They can't be changed, so child processes get a cleaned copy of these (see child_env()).
+_CHILD_TUNABLES = (
+    "BATCH_SIZE", "STREAM_BATCH_SIZE", "MAX_SPECIES", "MAX_IMAGES_PER_SPECIES", "VAL_IMAGES_PER_SPECIES",
+    "MAX_CACHE_IMAGES", "HEAD_EPOCHS", "HEAD_LR", "HEAD_BATCH", "HEAD_WEIGHT_DECAY", "HEAD_FEATURE_DROPOUT",
+    "HEAD_PATIENCE", "DISK_CACHE", "DISK_CACHE_DIR", "REPLACE_DB_FEATURES", "AUTO_EXTRACT_ARCHIVES",
+    "DATASET_NAME", "MODEL_OUTPUT", "ONNX_MODEL_PATH", "DB_PATH", "TURSO_URL", "TURSO_AUTH_TOKEN", "HF_TOKEN",
+)
+
+
+def child_env(**extra) -> dict:
+    env = dict(os.environ)
+    for k in _CHILD_TUNABLES:
+        if k in env:
+            env[k] = _env(k)
+    env.update(extra)
+    return env
 
 
 @dataclass
 class Settings:
-    api_key: str = field(default_factory=lambda: os.getenv("API_KEY", "").strip())
-    model_path: str = field(default_factory=lambda: os.getenv("MODEL_OUTPUT", "models/pokemon_classifier.pt"))
-    onnx_path: str = field(default_factory=lambda: os.getenv("ONNX_MODEL_PATH", ""))
+    api_key: str = field(default_factory=lambda: _env("API_KEY"))
+    model_path: str = field(default_factory=lambda: _env("MODEL_OUTPUT", "models/pokemon_classifier.pt"))
+    onnx_path: str = field(default_factory=lambda: _env("ONNX_MODEL_PATH"))
     auto_export_onnx: bool = field(default_factory=lambda: _env_bool("AUTO_EXPORT_ONNX", True))
-    onnx_threads: int = field(default_factory=lambda: max(1, int(os.getenv("ONNX_THREADS", "1"))))
-    infer_concurrency: int = field(default_factory=lambda: max(1, int(os.getenv("INFER_CONCURRENCY", "2"))))
-    top_k: int = field(default_factory=lambda: max(1, int(os.getenv("TOP_K", "5"))))
-    near_exact_sim: float = field(default_factory=lambda: float(os.getenv("NEAR_EXACT_SIM", "0.95")))
-    learn_dup_sim: float = field(default_factory=lambda: float(os.getenv("LEARN_DUP_SIM", "0.995")))
-    confidence_threshold: float = field(default_factory=lambda: float(os.getenv("CONFIDENCE_THRESHOLD", "0.5")))
-    max_upload_mb: float = field(default_factory=lambda: float(os.getenv("MAX_UPLOAD_MB", "10")))
-    max_batch: int = field(default_factory=lambda: max(1, int(os.getenv("MAX_BATCH", "32"))))
-    export_timeout_s: int = field(default_factory=lambda: int(os.getenv("EXPORT_TIMEOUT_S", "900")))
+    onnx_threads: int = field(default_factory=lambda: max(1, _env_int("ONNX_THREADS", 1)))
+    infer_concurrency: int = field(default_factory=lambda: max(1, _env_int("INFER_CONCURRENCY", 2)))
+    top_k: int = field(default_factory=lambda: max(1, _env_int("TOP_K", 5)))
+    near_exact_sim: float = field(default_factory=lambda: _env_float("NEAR_EXACT_SIM", 0.95))
+    learn_dup_sim: float = field(default_factory=lambda: _env_float("LEARN_DUP_SIM", 0.995))
+    confidence_threshold: float = field(default_factory=lambda: _env_float("CONFIDENCE_THRESHOLD", 0.5))
+    max_upload_mb: float = field(default_factory=lambda: _env_float("MAX_UPLOAD_MB", 10.0))
+    max_batch: int = field(default_factory=lambda: max(1, _env_int("MAX_BATCH", 32)))
+    export_timeout_s: int = field(default_factory=lambda: _env_int("EXPORT_TIMEOUT_S", 900))
     trainer_cmd: List[str] = field(default_factory=lambda: [sys.executable, "-u", "run_training.py"])
-    train_log: str = field(default_factory=lambda: os.getenv("TRAIN_LOG", "train.log"))
+    train_log: str = field(default_factory=lambda: _env("TRAIN_LOG", "train.log"))
 
     def __post_init__(self):
         if not self.onnx_path:
@@ -193,7 +240,7 @@ class Engine:
     def _export_onnx(self):
         log.info("exporting ONNX from %s (one-time, needs torch) ...", self.s.model_path)
         cmd = [sys.executable, "export_onnx.py", "--model", self.s.model_path, "--out", self.s.onnx_path]
-        env = dict(os.environ, DEBUG="1")  # train_model.py hides stderr unless DEBUG is set
+        env = child_env(DEBUG="1")  # train_model.py hides stderr unless DEBUG is set
         try:
             r = subprocess.run(cmd, cwd=APP_DIR, env=env, capture_output=True, text=True,
                                timeout=self.s.export_timeout_s)
@@ -337,7 +384,7 @@ class Trainer:
         if not (APP_DIR / "Extra pokemons.zip").exists() and not (APP_DIR / "Extra pokemons").is_dir():
             w.append("No 'Extra pokemons.zip' or 'Extra pokemons/' found: the extra species will be missing "
                      "from the new model, and with REPLACE_DB_FEATURES=true they are removed from the bank.")
-        if not os.getenv("TURSO_URL"):
+        if not _env("TURSO_URL"):
             w.append("TURSO_URL is not set: training writes to the local SQLite file DB_PATH.")
         return w
 
@@ -345,7 +392,7 @@ class Trainer:
         with self._lock:
             if self.state in ("running", "reloading"):
                 raise RuntimeError(f"a training run is already {self.state}")
-            env = dict(os.environ, DEBUG="1", PYTHONUNBUFFERED="1")  # DEBUG: keep tracebacks visible in the log
+            env = child_env(DEBUG="1", PYTHONUNBUFFERED="1")  # DEBUG: keep tracebacks visible in the log
             logf = open(self.log_path, "wb")
             try:
                 self.proc = subprocess.Popen(self.s.trainer_cmd, cwd=APP_DIR, env=env,
@@ -629,4 +676,4 @@ app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8000")), log_level="info")
+    uvicorn.run(app, host=_env("HOST", "0.0.0.0"), port=_env_int("PORT", 8000), log_level="info")
