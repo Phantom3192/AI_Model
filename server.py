@@ -170,8 +170,15 @@ class Settings:
     model_path: str = field(default_factory=lambda: _env("MODEL_OUTPUT", "models/pokemon_classifier.pt"))
     onnx_path: str = field(default_factory=lambda: _env("ONNX_MODEL_PATH"))
     auto_export_onnx: bool = field(default_factory=lambda: _env_bool("AUTO_EXPORT_ONNX", True))
-    onnx_threads: int = CORES                 # model threads: one lone spawn can use every core
-    infer_concurrency: int = CORES * 8        # parallel inference slots: bursts keep every core busy
+    # Intra-op threads per inference call. CORES lets one lone spawn finish fastest, but under
+    # concurrent load every request fights over the same fixed pool of CORES threads instead of
+    # each request getting its own core - set ONNX_THREADS=1 to let infer_concurrency (below) use
+    # the cores across *different* requests in parallel instead, which scales far better under load.
+    onnx_threads: int = field(default_factory=lambda: _env_int("ONNX_THREADS", CORES))
+    # Concurrent inference slots. CORES*8 is a good default only when onnx_threads=1 (each slot
+    # uses one core independently). If you raise ONNX_THREADS, lower this to roughly CORES /
+    # ONNX_THREADS so slots don't oversubscribe the same physical cores. Override directly if tuning.
+    infer_concurrency: int = field(default_factory=lambda: _env_int("INFER_CONCURRENCY", CORES * 8))
     max_pending: int = CORES * 128            # images allowed to wait for a slot; beyond that -> 503 "busy" (protects RAM)
     infer_chunk: int = 2
     top_k: int = field(default_factory=lambda: max(1, _env_int("TOP_K", 5)))
@@ -911,5 +918,18 @@ app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
+    # uvloop (libuv-backed event loop) cuts the per-request Python overhead of accepting
+    # connections and parsing HTTP - a real win since everything except the ONNX call itself
+    # runs on this one event loop. Falls back to the default loop if unavailable (e.g. Windows).
+    loop_impl = "auto"
+    try:
+        import uvloop  # noqa: F401
+    except ImportError:
+        loop_impl = "asyncio"
+        log.info("uvloop not installed - using the default asyncio loop (pip install uvloop for a bit more headroom)")
+    # Uvicorn's built-in per-request access log line is extra I/O on every single request;
+    # turn it off by default under load (your own app-level logs above are unaffected).
+    # Set UVICORN_ACCESS_LOG=1 to bring it back for debugging.
+    access_log = _env_bool("UVICORN_ACCESS_LOG", False)
     uvicorn.run(app, host=_env("HOST", "0.0.0.0"), port=_env_int("PORT", 8000), log_level="info",
-                timeout_keep_alive=75)
+                timeout_keep_alive=75, loop=loop_impl, access_log=access_log)
