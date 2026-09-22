@@ -239,6 +239,13 @@ IMAGE_WORKERS = int(os.getenv("IMAGE_WORKERS", str(os.cpu_count() or 2)))
 # reasonable default; raise it if your host's bandwidth/connections can take
 # more, lower it (to 1) to fall back to the old single-reader behavior.
 HF_SHARDS = int(os.getenv("HF_SHARDS", "4"))
+# Optional: a local copy of the HF dataset, laid out the same way as
+# "Extra pokemons" (one subfolder per species, images directly inside).
+# When present, species covered here are loaded straight off disk -
+# no network at all - and only whatever's still short of quota after
+# that falls through to live HF streaming. Point this at wherever you
+# upload the downloaded dataset on the server.
+LOCAL_DATASET_DIR = os.getenv("LOCAL_DATASET_DIR", "local_dataset")
 
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
@@ -786,8 +793,9 @@ class StreamingPokemonDataset(IterableDataset):
     Processes STREAM_BATCH_SIZE images, trains, then clears memory.
     """
     
-    def __init__(self, extra_dir: str = "Extra pokemons"):
+    def __init__(self, extra_dir: str = "Extra pokemons", local_dataset_dir: str = None):
         self.extra_dir = extra_dir
+        self.local_dataset_dir = local_dataset_dir or LOCAL_DATASET_DIR
         # NOTE: intentionally stops short of ToTensor+Normalize here. Every
         # image produced by this transform gets cached in self._cache for
         # reuse across epochs (see __iter__), so we store it as a uint8
@@ -1097,34 +1105,81 @@ class StreamingPokemonDataset(IterableDataset):
                     _flush_disk_chunk()
             return tensor, label
         
-        # First, yield local images
-        extra_path = Path(self.extra_dir)
-        if extra_path.exists():
-            for folder in extra_path.iterdir():
-                if not folder.is_dir():
+        # First, yield local images - "Extra pokemons" (hand-added species)
+        # and, if present, a full local copy of the HF dataset uploaded to
+        # LOCAL_DATASET_DIR. Both are plain disk reads (not network), so
+        # this is where IMAGE_WORKERS parallel decode actually pays off -
+        # unlike the HF stream, several images really do decode at once
+        # here. Whatever's still short of MAX_IMAGES_PER_SPECIES per
+        # species after this falls through to live HF streaming below.
+        local_in_flight: "deque" = deque()
+
+        def _local_drain_one():
+            fut, lbl, spc = local_in_flight.popleft()
+            tensor = fut.result()
+            return _emit(tensor, lbl, spc)
+
+        valid_extensions = {".png", ".jpg", ".jpeg", ".webp"}
+        local_dirs = [d for d in (self.extra_dir, self.local_dataset_dir) if d]
+
+        with ThreadPoolExecutor(max_workers=IMAGE_WORKERS) as local_executor:
+            for local_dir in local_dirs:
+                local_path = Path(local_dir)
+                if not local_path.exists():
+                    if local_dir == self.local_dataset_dir and local_dir != "local_dataset":
+                        log.warning(f"   ⚠️ LOCAL_DATASET_DIR '{local_dir}' does not exist, skipping")
                     continue
-                
-                species = folder.name.replace("_", " ").strip().lower()
-                if species not in self.species_to_idx:
-                    continue
-                
-                label = self.species_to_idx[species]
-                valid_extensions = {".png", ".jpg", ".jpeg", ".webp"}
-                
-                for img_path in folder.iterdir():
-                    if species_counts.get(species, 0) >= MAX_IMAGES_PER_SPECIES:
-                        break
-                    if img_path.suffix.lower() not in valid_extensions:
+
+                log.info(f"   📂 Loading local images from '{local_dir}'...")
+                folder_count = 0
+                for folder in local_path.iterdir():
+                    if not folder.is_dir():
                         continue
-                    
-                    try:
-                        img = Image.open(img_path).convert("RGB")
-                        if img.size[0] > 10 and img.size[1] > 10:
-                            item = _emit(self.transform(img), label, species)
+
+                    species = folder.name.replace("_", " ").strip().lower()
+                    if species not in self.species_to_idx:
+                        continue
+
+                    label = self.species_to_idx[species]
+                    folder_count += 1
+
+                    for img_path in folder.iterdir():
+                        if species_counts.get(species, 0) >= MAX_IMAGES_PER_SPECIES:
+                            break
+                        if img_path.suffix.lower() not in valid_extensions:
+                            continue
+
+                        try:
+                            img = Image.open(img_path).convert("RGB")
+                            if img.size[0] <= 10 or img.size[1] <= 10:
+                                continue
+                        except Exception:
+                            continue
+
+                        local_in_flight.append(
+                            (local_executor.submit(self.transform, img), label, species))
+                        if len(local_in_flight) >= IMAGE_WORKERS:
+                            item = _local_drain_one()
                             if item is not None:
                                 yield item
-                    except Exception:
-                        continue
+
+                        if collected >= target_total:
+                            break
+                    if collected >= target_total:
+                        break
+
+                log.info(f"   📂 '{local_dir}': matched {folder_count} species folders, "
+                         f"{collected}/{target_total} images collected so far")
+                if collected >= target_total:
+                    break
+
+            while local_in_flight:
+                try:
+                    item = _local_drain_one()
+                    if item is not None:
+                        yield item
+                except Exception:
+                    continue
         
         log.info(f"   📂 Local images collected: {collected}/{target_total}")
         
