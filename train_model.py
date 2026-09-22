@@ -16,8 +16,10 @@ import gc
 import resource
 import threading
 import queue
+from concurrent.futures import ThreadPoolExecutor
 import base64
 from pathlib import Path
+from collections import deque
 from typing import Dict, List, Optional, Tuple, Any, Iterator
 from io import BytesIO
 import re
@@ -220,6 +222,23 @@ VAL_IMAGES_PER_SPECIES = int(os.getenv("VAL_IMAGES_PER_SPECIES", "2"))
 # more RAM to spare; set to 0 to disable caching entirely (every epoch
 # re-streams from Hugging Face - slower, but flat memory usage).
 MAX_CACHE_IMAGES = int(os.getenv("MAX_CACHE_IMAGES", "0"))
+# How many images get decoded+transformed (PIL resize/rotate/color-jitter) in
+# parallel. That step is the real CPU cost per image and is pure computation
+# (no shared state), so it's safe to run several at once in a thread pool -
+# PIL/torchvision's C-level resize/rotate code releases the GIL, so threads
+# here get genuine multi-core use, unlike plain Python loops. Reading the next
+# row from the HF stream stays single-threaded (network I/O, and the HF
+# streaming iterator isn't safe to pull from concurrently). Defaults to your
+# core count so it actually uses all of them instead of capping at one.
+IMAGE_WORKERS = int(os.getenv("IMAGE_WORKERS", str(os.cpu_count() or 2)))
+# How many independent readers pull from the HF streaming dataset at once
+# (each covering a distinct slice of the dataset's underlying files via
+# ds.shard). This is what actually addresses network round-trip latency -
+# IMAGE_WORKERS alone only parallelizes the CPU-side decode/transform, which
+# doesn't help while every reader is just waiting on the network. 4 is a
+# reasonable default; raise it if your host's bandwidth/connections can take
+# more, lower it (to 1) to fall back to the old single-reader behavior.
+HF_SHARDS = int(os.getenv("HF_SHARDS", "4"))
 
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
@@ -1142,55 +1161,135 @@ class StreamingPokemonDataset(IterableDataset):
                 image_col = list(features.keys())[1] if len(features) > 1 else list(features.keys())[0]
             
             rows_scanned = 0
-            
-            for row in ds:
-                rows_scanned += 1
-                
-                # Heartbeat so it never looks frozen, even mid-scan
-                if rows_scanned % 200 == 0:
-                    elapsed = time.time() - t_start
-                    log.info(f"   🔎 Scanned {rows_scanned} HF rows, "
-                             f"kept {collected}/{target_total} images "
-                             f"({elapsed:.0f}s elapsed)")
-                
+            # Bounded FIFO of (future, label, species) still being decoded/
+            # transformed. Draining (and therefore _emit, which touches
+            # shared quota/cache state) still only ever happens on the main
+            # thread, one at a time - only the CPU-heavy transform itself
+            # runs concurrently.
+            in_flight: "deque" = deque()
+
+            def _drain_one():
+                fut, lbl, spc = in_flight.popleft()
+                tensor = fut.result()
+                return _emit(tensor, lbl, spc)
+
+            # --- Parallel HF readers -------------------------------------
+            # A single `for row in ds:` loop is bottlenecked on one HTTP
+            # connection's round-trip latency per row, not on CPU - that's
+            # why decode-side parallelism alone didn't move the needle.
+            # HF_SHARDS independent readers, each covering a distinct slice
+            # of the dataset's underlying files (ds.shard), download+read
+            # concurrently and feed a shared queue. The main thread is the
+            # only place that touches species_counts/collected/disk
+            # chunking, so correctness is unchanged - this just gets rows
+            # (and the decode work on them) arriving several-at-once
+            # instead of one-at-a-time.
+            row_queue: "queue.Queue" = queue.Queue(maxsize=max(4, HF_SHARDS * 4))
+            stop_event = threading.Event()
+            _SHARD_DONE = object()
+
+            def _shard_worker(shard_ds, shard_idx):
                 try:
-                    raw_label = row[label_col]
-                    if isinstance(raw_label, int):
-                        raw_label = features[label_col].int2str(raw_label)
-                    
-                    species = str(raw_label).strip().lower()
-                    
-                    if species not in self.species_to_idx:
+                    for row in shard_ds:
+                        if stop_event.is_set():
+                            return
+                        try:
+                            raw_label = row[label_col]
+                            if isinstance(raw_label, int):
+                                raw_label = features[label_col].int2str(raw_label)
+                            species = str(raw_label).strip().lower()
+                            if species not in self.species_to_idx:
+                                continue
+                            # Soft check only (no lock) - species_counts is only
+                            # ever written on the main thread, so a shard thread
+                            # may read a slightly stale value and fetch a few
+                            # images past quota. Harmless; the main thread's
+                            # target_total check below is what actually stops
+                            # things.
+                            if species_counts.get(species, 0) >= MAX_IMAGES_PER_SPECIES:
+                                continue
+                            img = row[image_col]
+                            if img is None:
+                                continue
+                            if not isinstance(img, Image.Image):
+                                img = Image.open(BytesIO(img))
+                            if img.size[0] < 10 or img.size[1] < 10:
+                                continue
+                            label = self.species_to_idx[species]
+                            row_queue.put((img, label, species))
+                        except Exception:
+                            continue
+                except Exception as e:
+                    log.warning(f"   ⚠️ HF shard {shard_idx} reader stopped early: {e}")
+                finally:
+                    row_queue.put(_SHARD_DONE)
+
+            shard_threads = []
+            try:
+                for i in range(HF_SHARDS):
+                    shard_ds = ds.shard(num_shards=HF_SHARDS, index=i, contiguous=True) if HF_SHARDS > 1 else ds
+                    t = threading.Thread(target=_shard_worker, args=(shard_ds, i), daemon=True)
+                    shard_threads.append(t)
+            except Exception as e:
+                # Dataset couldn't be sharded (e.g. single underlying file) -
+                # fall back to one plain reader instead of failing the run.
+                log.warning(f"   ⚠️ Could not split dataset into {HF_SHARDS} shards ({e}), "
+                            f"falling back to a single reader")
+                shard_threads = [threading.Thread(target=_shard_worker, args=(ds, 0), daemon=True)]
+
+            for t in shard_threads:
+                t.start()
+            active_shards = len(shard_threads)
+            log.info(f"   🧵 Streaming with {active_shards} parallel HF reader(s), "
+                     f"{IMAGE_WORKERS} decode worker(s)")
+
+            with ThreadPoolExecutor(max_workers=IMAGE_WORKERS) as executor:
+                while active_shards > 0:
+                    entry = row_queue.get()
+                    if entry is _SHARD_DONE:
+                        active_shards -= 1
                         continue
                     
-                    if species_counts.get(species, 0) >= MAX_IMAGES_PER_SPECIES:
-                        continue
+                    img, label, species = entry
+                    rows_scanned += 1
                     
-                    img = row[image_col]
-                    if img is None:
-                        continue
+                    # Heartbeat so it never looks frozen, even mid-scan
+                    if rows_scanned % 200 == 0:
+                        elapsed = time.time() - t_start
+                        log.info(f"   🔎 Scanned {rows_scanned} HF rows, "
+                                 f"kept {collected}/{target_total} images "
+                                 f"({elapsed:.0f}s elapsed)")
                     
-                    if not isinstance(img, Image.Image):
-                        img = Image.open(BytesIO(img))
-                    
-                    if img.size[0] < 10 or img.size[1] < 10:
-                        continue
-                    
-                    label = self.species_to_idx[species]
-                    
-                    item = _emit(self.transform(img), label, species)
-                    if item is not None:
-                        yield item
+                    in_flight.append((executor.submit(self.transform, img), label, species))
+                    if len(in_flight) >= IMAGE_WORKERS:
+                        item = _drain_one()
+                        if item is not None:
+                            yield item
                     
                     # Stop as soon as every species has its quota instead
                     # of scanning the rest of the dataset for nothing.
+                    # (collected lags slightly behind submission since it's
+                    # only updated as results drain - a handful of extra
+                    # in-flight/in-queue images past quota is harmless.)
                     if collected >= target_total:
                         log.info(f"   ✅ Quota met ({collected}/{target_total}) "
                                  f"after scanning {rows_scanned} HF rows")
+                        stop_event.set()
                         break
-                    
-                except Exception:
-                    continue
+                
+                # Drain whatever's still in flight after the loop ends
+                # (quota met, HF exhausted, or break above).
+                while in_flight:
+                    try:
+                        item = _drain_one()
+                        if item is not None:
+                            yield item
+                    except Exception:
+                        continue
+            
+            stop_event.set()
+            for t in shard_threads:
+                t.join(timeout=5)
                 
         except Exception as e:
             log.warning(f"Error streaming from Hugging Face: {e}")
