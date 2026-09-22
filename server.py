@@ -468,18 +468,37 @@ class Trainer:
             if self.state in ("running", "reloading"):
                 raise RuntimeError(f"a training run is already {self.state}")
             env = child_env(DEBUG="1", PYTHONUNBUFFERED="1")  # DEBUG: keep tracebacks visible in the log
-            logf = open(self.log_path, "wb")
-            try:
-                self.proc = subprocess.Popen(self.s.trainer_cmd, cwd=APP_DIR, env=env,
-                                             stdout=logf, stderr=subprocess.STDOUT)
-            finally:
-                logf.close()
+            # stdout=PIPE (not the log file directly) so _pump_output can tee each line to
+            # both the log file and this server's own terminal, live, as it's produced.
+            self.proc = subprocess.Popen(self.s.trainer_cmd, cwd=APP_DIR, env=env,
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         bufsize=1, text=True)
             self.state, self._stop_requested = "running", False
             self.started_at, self.finished_at, self.returncode = time.time(), None, None
             self.reload_result = self.reload_error = None
+            threading.Thread(target=self._pump_output, args=(self.proc,), daemon=True).start()
             threading.Thread(target=self._watch, args=(self.proc,), daemon=True).start()
             log.info("training started (pid %d)", self.proc.pid)
             return {"pid": self.proc.pid, "warnings": self.warnings()}
+
+    def _pump_output(self, proc: subprocess.Popen):
+        """Read the trainer's stdout line by line and write it to BOTH train.log and this
+        server's own stdout, so you can watch progress live in the terminal server.py runs
+        in, not just via GET /admin/train/status."""
+        try:
+            with open(self.log_path, "w", encoding="utf-8", errors="replace") as logf:
+                for line in proc.stdout:
+                    sys.stdout.write(f"[train] {line}")
+                    sys.stdout.flush()
+                    logf.write(line)
+                    logf.flush()
+        except Exception as e:
+            log.error("training output pump crashed: %s", e)
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
 
     def _watch(self, proc: subprocess.Popen):
         rc = proc.wait()
