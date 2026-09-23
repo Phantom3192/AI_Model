@@ -3,8 +3,8 @@ feature_bank.py - the embedding bank behind the AI_Model API.
 
 Holds every stored (species, vector) pair as one NumPy matrix in memory (so a lookup is a single
 matrix multiply) and keeps it in sync with the `pokemon_features` table that train_model.py writes.
-It talks to the same database as the trainer: Turso if TURSO_URL is set, otherwise the local
-SQLite file DB_PATH.
+It talks to the same PostgreSQL database as the trainer (POSTGRES_DSN, or the standard libpq env
+vars PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE).
 
 Deliberately has NO torch / train_model dependency, so the API server can run on onnxruntime alone.
 """
@@ -15,12 +15,12 @@ import json
 import time
 import uuid
 import difflib
-import sqlite3
 import logging
 import threading
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
+import psycopg2
 
 log = logging.getLogger("ai_model.bank")
 
@@ -45,12 +45,11 @@ def _env(name: str, default: str = "") -> str:
 
 
 class FeatureBank:
-    def __init__(self, turso_url: Optional[str] = None, turso_token: Optional[str] = None,
-                 db_path: Optional[str] = None):
-        self.turso_url = turso_url if turso_url is not None else _env("TURSO_URL")
-        self.turso_token = turso_token if turso_token is not None else _env("TURSO_AUTH_TOKEN")
-        self.db_path = db_path or _env("DB_PATH", "pokemon.db")
-        self.backend = "sqlite"
+    def __init__(self, dsn: Optional[str] = None, db_path: Optional[str] = None):
+        # db_path kept in the signature for backwards-compat with any caller that still passes it;
+        # it is ignored now that everything goes through PostgreSQL.
+        self.dsn = dsn if dsn is not None else _env("POSTGRES_DSN")
+        self.backend = "postgres"
 
         self.version = 0                      # bumped whenever the in-memory bank changes
         self._species: List[str] = []
@@ -62,16 +61,10 @@ class FeatureBank:
 
     # ------------------------------------------------------------------ connection
     def _connect(self):
-        if self.turso_url:
-            # No silent SQLite fallback here: a server quietly learning into a throwaway local file
-            # while the real bank lives in Turso is worse than a clear startup error.
-            import libsql
-            conn = libsql.connect(self.turso_url, auth_token=self.turso_token)
-            self.backend = "turso"
-            return conn
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.backend = "sqlite"
-        return conn
+        # POSTGRES_DSN if set, else libpq's own env vars (PGHOST, PGUSER, ...).
+        if self.dsn:
+            return psycopg2.connect(self.dsn)
+        return psycopg2.connect()
 
     def _reconnect(self):
         try:
@@ -81,7 +74,7 @@ class FeatureBank:
         self._conn = self._connect()
 
     def _db(self, fn: Callable):
-        """Run fn(conn); on failure reconnect once and retry (Turso connections can go stale)."""
+        """Run fn(conn); on failure reconnect once and retry (PostgreSQL connections can go stale)."""
         try:
             return fn(self._conn)
         except Exception as e:
@@ -95,18 +88,18 @@ class FeatureBank:
             try:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS pokemon_features (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        id BIGSERIAL PRIMARY KEY,
                         species TEXT NOT NULL,
                         variant_name TEXT NOT NULL,
                         feature_vector TEXT NOT NULL,
-                        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                        created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM now())::bigint),
                         UNIQUE(species, variant_name)
                     )""")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS species_info (
                         species TEXT PRIMARY KEY,
                         count INTEGER DEFAULT 0,
-                        last_updated INTEGER DEFAULT (strftime('%s', 'now'))
+                        last_updated BIGINT DEFAULT (EXTRACT(EPOCH FROM now())::bigint)
                     )""")
                 conn.commit()
             finally:
@@ -241,13 +234,14 @@ class FeatureBank:
             try:
                 cur.execute(
                     "INSERT INTO pokemon_features (species, variant_name, feature_vector, created_at) "
-                    "VALUES (?, ?, ?, strftime('%s', 'now'))",
+                    "VALUES (%s, %s, %s, EXTRACT(EPOCH FROM now())::bigint)",
                     (species, variant, payload),
                 )
                 cur.execute(
                     "INSERT INTO species_info (species, count, last_updated) "
-                    "VALUES (?, 1, strftime('%s', 'now')) "
-                    "ON CONFLICT(species) DO UPDATE SET count = count + 1, last_updated = strftime('%s', 'now')",
+                    "VALUES (%s, 1, EXTRACT(EPOCH FROM now())::bigint) "
+                    "ON CONFLICT(species) DO UPDATE SET count = species_info.count + 1, "
+                    "last_updated = EXCLUDED.last_updated",
                     (species,),
                 )
                 conn.commit()
@@ -267,10 +261,10 @@ class FeatureBank:
             def run(conn):
                 cur = conn.cursor()
                 try:
-                    query = "SELECT id, species FROM pokemon_features WHERE instr(variant_name, ?) > 0"
+                    query = "SELECT id, species FROM pokemon_features WHERE position(%s in variant_name) > 0"
                     params = [LEARNED_MARK]
                     if species:
-                        query += " AND species = ?"
+                        query += " AND species = %s"
                         params.append(species)
                     query += " ORDER BY id DESC"
                     if last_only:
@@ -278,8 +272,8 @@ class FeatureBank:
                     cur.execute(query, params)
                     rows = [(r[0], r[1]) for r in cur.fetchall()]
                     for row_id, sp in rows:
-                        cur.execute("DELETE FROM pokemon_features WHERE id = ?", (row_id,))
-                        cur.execute("UPDATE species_info SET count = MAX(count - 1, 0) WHERE species = ?", (sp,))
+                        cur.execute("DELETE FROM pokemon_features WHERE id = %s", (row_id,))
+                        cur.execute("UPDATE species_info SET count = GREATEST(count - 1, 0) WHERE species = %s", (sp,))
                     conn.commit()
                     return rows
                 except Exception:
@@ -302,7 +296,7 @@ class FeatureBank:
         def run(conn):
             cur = conn.cursor()
             try:
-                cur.execute("SELECT COUNT(*) FROM pokemon_features WHERE instr(variant_name, ?) > 0", (LEARNED_MARK,))
+                cur.execute("SELECT COUNT(*) FROM pokemon_features WHERE position(%s in variant_name) > 0", (LEARNED_MARK,))
                 return int(cur.fetchone()[0])
             finally:
                 _close(cur)
