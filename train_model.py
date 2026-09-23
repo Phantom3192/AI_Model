@@ -1224,18 +1224,23 @@ class StreamingPokemonDataset(IterableDataset):
                 finally:
                     row_queue.put(_SHARD_DONE)
 
+            # Read the dataset's real underlying shard count directly instead
+            # of guessing via trial-and-error: ds.shard(n, i) requires
+            # n <= ds.num_shards, and a single failing index used to abort
+            # the whole loop and silently drop ALL readers to 1. Clamping up
+            # front is deterministic and tells us straight away whether this
+            # dataset can be parallelized at all.
+            n_readers = max(1, min(HF_SHARDS, ds.num_shards))
+            if n_readers < HF_SHARDS:
+                log.warning(f"   ⚠️ Dataset only exposes {ds.num_shards} underlying "
+                            f"file(s) - HF_SHARDS={HF_SHARDS} clamped to {n_readers}. "
+                            f"{'This dataset cannot be parallelized via file-sharding; consider a bulk download instead.' if ds.num_shards == 1 else ''}")
+
             shard_threads = []
-            try:
-                for i in range(HF_SHARDS):
-                    shard_ds = ds.shard(num_shards=HF_SHARDS, index=i, contiguous=True) if HF_SHARDS > 1 else ds
-                    t = threading.Thread(target=_shard_worker, args=(shard_ds, i), daemon=True)
-                    shard_threads.append(t)
-            except Exception as e:
-                # Dataset couldn't be sharded (e.g. single underlying file) -
-                # fall back to one plain reader instead of failing the run.
-                log.warning(f"   ⚠️ Could not split dataset into {HF_SHARDS} shards ({e}), "
-                            f"falling back to a single reader")
-                shard_threads = [threading.Thread(target=_shard_worker, args=(ds, 0), daemon=True)]
+            for i in range(n_readers):
+                shard_ds = ds.shard(num_shards=n_readers, index=i, contiguous=True) if n_readers > 1 else ds
+                t = threading.Thread(target=_shard_worker, args=(shard_ds, i), daemon=True)
+                shard_threads.append(t)
 
             for t in shard_threads:
                 t.start()
@@ -1364,9 +1369,16 @@ def build_feature_bank(items, fe: "PokemonFeatureExtractor", batch_size: int,
     n = 0
     n_flush = 0
     t0 = time.time()
+    # For the log line: track (count, time) at the last checkpoint so we can
+    # report a windowed (recent) rate instead of a lifetime average since t0.
+    # A lifetime average dilutes forever once the initial fast disk-cache
+    # replay is folded in, so it never stops "falling" even after the real
+    # rate has flattened out - a windowed rate reflects current throughput.
+    n_at_last_log = 0
+    t_at_last_log = t0
 
     def flush():
-        nonlocal n, n_flush
+        nonlocal n, n_flush, n_at_last_log, t_at_last_log
         if not buf_i:
             return
         feats.append(_backbone_features(fe, torch.stack(buf_i)).cpu())
@@ -1377,7 +1389,13 @@ def build_feature_bank(items, fe: "PokemonFeatureExtractor", batch_size: int,
         buf_l.clear()
         if n_flush % 25 == 0:
             of = f"/{total_hint}" if total_hint else ""
-            log.info(f"   🧊 [{tag}] {n}{of} images embedded ({n / max(time.time() - t0, 1e-6):.0f} img/s)")
+            now = time.time()
+            window_rate = (n - n_at_last_log) / max(now - t_at_last_log, 1e-6)
+            lifetime_rate = n / max(now - t0, 1e-6)
+            log.info(f"   🧊 [{tag}] {n}{of} images embedded "
+                     f"({window_rate:.1f} img/s recent, {lifetime_rate:.1f} img/s avg)")
+            n_at_last_log = n
+            t_at_last_log = now
         if n_flush % 100 == 0:
             gc.collect()
             _trim_memory()
