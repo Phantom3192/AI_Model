@@ -64,6 +64,7 @@ import numpy as np
 from tqdm import tqdm
 
 import psycopg2
+import psycopg2.extras
 
 # ============ SILENT LOGGER ============
 class SilentLogger:
@@ -239,6 +240,16 @@ IMAGE_WORKERS = int(os.getenv("IMAGE_WORKERS", str(os.cpu_count() or 2)))
 # reasonable default; raise it if your host's bandwidth/connections can take
 # more, lower it (to 1) to fall back to the old single-reader behavior.
 HF_SHARDS = int(os.getenv("HF_SHARDS", "4"))
+# Directory for the on-disk feature banks. This is the KEY fix for the
+# RAM-growth crash: backbone features used to be accumulated in a Python
+# list and then torch.cat'd into one big tensor at the end of the pass -
+# for ~28k images at 1280-dim fp32 that's ~14 GB of intermediate storage
+# plus the concat transient, which is what OOM-killed the container. They
+# now go straight into a memory-mapped fp16 file on disk as they're
+# produced, so peak RAM for the whole feature pass is one batch.
+FEATURE_BANK_DIR = Path(os.getenv("FEATURE_BANK_DIR", "feature_bank_tmp"))
+# Feature dimension written by EfficientNet-B0 (must match PokemonFeatureExtractor's backbone_dim).
+BACKBONE_DIM = 1280
 
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
@@ -403,7 +414,7 @@ class Database:
                 id BIGSERIAL PRIMARY KEY,
                 species TEXT NOT NULL,
                 variant_name TEXT NOT NULL,
-                feature_vector TEXT NOT NULL,
+                feature_vector BYTEA NOT NULL,
                 created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM now())::bigint),
                 UNIQUE(species, variant_name)
             )
@@ -459,7 +470,7 @@ class Database:
                 existing_count = cursor.fetchone()[0]
                 variant_names = [f"{species}_{existing_count + i + 1}" for i in range(len(features))]
                 for i, feature in enumerate(features):
-                    feature_json = json.dumps(feature.tolist())
+                    raw = np.ascontiguousarray(feature, dtype=np.float32).tobytes()
                     cursor.execute("""
                         INSERT INTO pokemon_features 
                         (species, variant_name, feature_vector, created_at)
@@ -467,7 +478,7 @@ class Database:
                         ON CONFLICT (species, variant_name) DO UPDATE SET
                             feature_vector = EXCLUDED.feature_vector,
                             created_at = EXCLUDED.created_at
-                    """, (species, variant_names[i], feature_json))
+                    """, (species, variant_names[i], psycopg2.Binary(raw)))
                 cursor.execute("""
                     INSERT INTO species_info (species, count, last_updated)
                     VALUES (%s, %s, EXTRACT(EPOCH FROM now())::bigint)
@@ -504,17 +515,15 @@ class Database:
     def bulk_add_features(self, species_to_features: Dict[str, List[np.ndarray]],
                           rows_per_stmt: int = 50, stmts_per_commit: int = 10):
         """
-        Fast bulk insert: multi-row INSERT statements (50 rows each) instead of
-        one round-trip per row + a COUNT(*) per species. Over a remote Turso
-        connection the per-row version costs seconds per image.
-        Assumes the table was just cleared (variant names restart at 1 and
-        species_info.count is set, not incremented).
+        Fast bulk insert. Feature vectors are stored as raw fp32 BYTEA (not JSON text),
+        which is ~3.4x smaller on disk/network at 300k rows and avoids a json.loads
+        on every row during the API server's bank load.
         """
         rows = []
         for species, feats in species_to_features.items():
             for i, feat in enumerate(feats):
-                # 6 decimals is plenty for cosine similarity and ~halves the payload
-                rows.append((species, f"{species}_{i + 1}", json.dumps(np.round(feat, 6).tolist())))
+                raw = np.ascontiguousarray(feat, dtype=np.float32).tobytes()
+                rows.append((species, f"{species}_{i + 1}", psycopg2.Binary(raw)))
 
         cursor = self._conn.cursor()
         try:
@@ -664,9 +673,6 @@ class Database:
 
 
 # ============ AI MODEL ============
-
-BACKBONE_DIM = 1280  # EfficientNet-B0's pooled feature size
-
 
 class PokemonFeatureExtractor(nn.Module):
     def __init__(self, embedding_dim: int = 256):
@@ -824,6 +830,139 @@ class PokemonClassifier(nn.Module):
             features_tensor = torch.tensor(features, dtype=torch.float32).to(DEVICE)
         logits = self.classifier(features_tensor)
         return features_tensor, logits
+
+
+# ============ DISK-BACKED FEATURE BANK (the RAM fix) ============
+
+class FeatureBank:
+    """
+    Memory-mapped, on-disk store of frozen-backbone features for one dataset
+    split (train or val), plus the labels.
+
+    Why this exists: the old build_feature_bank accumulated every feature
+    tensor in a Python list (`feats`), then torch.cat'd the whole thing at
+    the end. For ~28k images that's ~14 GB of fp32 storage in `feats` plus
+    a ~14 GB transient during the cat - which is what OOM-killed the
+    container. This class writes each batch straight into an np.memmap
+    file on disk instead, so:
+      - peak RAM during the feature pass is ONE batch (a few MB), not the
+        whole dataset;
+      - the head can be trained by reading batches back from the memmap,
+        so the giant in-RAM Xtr tensor never exists;
+      - the DB-write phase (write_features_to_db) can also stream batches
+        in, for the same reason.
+
+    Storage layout: features are fp16 (half precision). Backbone features
+    are ImageNet-pretrained activations - cosine retrieval on fp16 vs
+    fp32 changes neighbours by ~1e-3 at most, well inside the noise of the
+    similarity scores themselves. fp16 halves the disk file and halves
+    every batch read during training.
+
+    Two files per split:
+      <name>.npy  - an fp16 numpy array of shape (capacity, BACKBONE_DIM),
+                    memory-mapped; only the rows actually written are valid.
+      <name>_labels.pt - a torch-saved list of labels, one per written row.
+    """
+
+    def __init__(self, name: str, base_dir: Path, dim: int = BACKBONE_DIM,
+                 capacity: int = 100_000):
+        self.name = name
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.dim = dim
+        self.features_path = self.base_dir / f"{name}.npy"
+        self.labels_path = self.base_dir / f"{name}_labels.pt"
+        self.idx_path = self.base_dir / f"{name}.idx"
+
+        # Pre-allocate the whole file once (sparse, so it costs nothing on
+        # disk until written) rather than growing it by reallocation, which
+        # would double peak memory briefly.
+        self._capacity = capacity
+        if not self.features_path.exists():
+            mm = np.lib.format.open_memmap(
+                str(self.features_path), mode="w+",
+                dtype=np.float16, shape=(capacity, dim),
+            )
+            del mm  # just to create the file; we reopen in append mode below
+
+        self._features = np.lib.format.open_memmap(
+            str(self.features_path), mode="r+", dtype=np.float16,
+        )
+        if self.labels_path.exists():
+            self._labels: List[int] = torch.load(self.labels_path, weights_only=False)
+        else:
+            self._labels = []
+        self._n = len(self._labels)
+
+    def append_batch(self, feats: torch.Tensor, labels: torch.Tensor):
+        """
+        feats: (B, dim) fp32 or fp16 tensor.
+        labels: (B,) int tensor.
+        Writes the fp16 copy of feats into the memmap and extends labels.
+        """
+        if feats.size(0) == 0:
+            return
+        need = self._n + feats.size(0)
+        if need > self._features.shape[0]:
+            raise RuntimeError(
+                f"FeatureBank '{self.name}' capacity {self._features.shape[0]} "
+                f"exceeded ({need} rows). Raise the `capacity=` argument."
+            )
+        self._features[self._n:need] = feats.to(torch.float16).cpu().numpy()
+        self._labels.extend(labels.tolist())
+        self._n = need
+
+    def flush(self):
+        """Force memmap writes to disk + persist the label list + row count."""
+        try:
+            self._features.flush()
+        except Exception:
+            pass
+        torch.save(self._labels, self.labels_path)
+        self.idx_path.write_text(json.dumps({"n": self._n, "dim": self.dim}))
+
+    def __len__(self):
+        return self._n
+
+    def iter_batches(self, batch_size: int, shuffle: bool = False, seed: int = 0):
+        """
+        Yields (features_fp32_cpu, idx, labels_long_cpu) batches WITHOUT holding
+        the whole array in RAM. If shuffle=True, indices are permuted first
+        and the batch is assembled by fancy-indexing the memmap.
+        """
+        n = self._n
+        if n == 0:
+            return
+        if shuffle:
+            g = torch.Generator().manual_seed(seed)
+            order = torch.randperm(n, generator=g)
+        else:
+            order = torch.arange(n)
+        all_labels = torch.tensor(self._labels, dtype=torch.long)
+        for i in range(0, n, batch_size):
+            idx = order[i:i + batch_size]
+            # Fancy-index the memmap -> numpy array -> torch tensor. Only
+            # this slice is resident; the rest of the file stays on disk.
+            xb_np = np.asarray(self._features[idx.numpy()])
+            yield torch.from_numpy(xb_np).float(), idx, all_labels[idx]
+
+    def get_batch(self, idx: torch.Tensor):
+        """Fancy-index a specific set of rows -> (B, dim) fp32 tensor."""
+        xb_np = np.asarray(self._features[idx.numpy()])
+        return torch.from_numpy(xb_np).float()
+
+    def labels_tensor(self) -> torch.Tensor:
+        return torch.tensor(self._labels, dtype=torch.long)
+
+    def close(self):
+        try:
+            self.flush()
+        except Exception:
+            pass
+        try:
+            del self._features
+        except Exception:
+            pass
 
 
 # ============ STREAMING DATASET ============
@@ -1398,30 +1537,25 @@ def _backbone_features(fe: "PokemonFeatureExtractor", batch_u8: torch.Tensor) ->
 
 
 @torch.no_grad()
-def build_feature_bank(items, fe: "PokemonFeatureExtractor", batch_size: int,
-                       total_hint: int = 0, tag: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
+def build_feature_bank(items, fe: "PokemonFeatureExtractor", bank: "FeatureBank",
+                       batch_size: int, total_hint: int = 0, tag: str = "train") -> int:
     """
-    One pass over `items` (any iterable of (uint8 image tensor, label)),
-    returning (features [N,1280], labels [N]).
+    Streams `items` (an iterable of (uint8 image tensor, label)) through the
+    frozen backbone and APPENDS the resulting features to `bank` (a
+    FeatureBank backed by an on-disk memmap). Returns the number of rows
+    written.
 
-    The backbone is frozen and the cached images are already augmented, so
-    its output for a given image never changes between epochs - computing it
-    once and training the head on the cached vectors is mathematically the
-    same as the old per-epoch forward pass, ~1000x cheaper, and lets us
-    shuffle freely (see train_head).
+    This replaces the old list-and-concat version. That version held every
+    feature tensor in a Python list and then torch.cat'd the whole thing at
+    the end - ~14 GB of fp32 storage plus the concat transient for a
+    ~28k-image run, which is what OOM-killed the container. Here, only the
+    current batch is ever in RAM; everything already processed is on disk.
     """
-    feats: List[torch.Tensor] = []
-    labels: List[int] = []
     buf_i: List[torch.Tensor] = []
     buf_l: List[int] = []
     n = 0
     n_flush = 0
     t0 = time.time()
-    # For the log line: track (count, time) at the last checkpoint so we can
-    # report a windowed (recent) rate instead of a lifetime average since t0.
-    # A lifetime average dilutes forever once the initial fast disk-cache
-    # replay is folded in, so it never stops "falling" even after the real
-    # rate has flattened out - a windowed rate reflects current throughput.
     n_at_last_log = 0
     t_at_last_log = t0
 
@@ -1429,8 +1563,9 @@ def build_feature_bank(items, fe: "PokemonFeatureExtractor", batch_size: int,
         nonlocal n, n_flush, n_at_last_log, t_at_last_log
         if not buf_i:
             return
-        feats.append(_backbone_features(fe, torch.stack(buf_i)).cpu())
-        labels.extend(buf_l)
+        feats = _backbone_features(fe, torch.stack(buf_i))    # (B, 1280) fp32 on DEVICE
+        labels = torch.tensor(buf_l, dtype=torch.long)
+        bank.append_batch(feats, labels)                      # writes fp16 to memmap
         n += len(buf_i)
         n_flush += 1
         buf_i.clear()
@@ -1445,6 +1580,7 @@ def build_feature_bank(items, fe: "PokemonFeatureExtractor", batch_size: int,
             n_at_last_log = n
             t_at_last_log = now
         if n_flush % 100 == 0:
+            bank.flush()
             gc.collect()
             _trim_memory()
             log_memory(f"{tag} feature pass")
@@ -1455,28 +1591,44 @@ def build_feature_bank(items, fe: "PokemonFeatureExtractor", batch_size: int,
         if len(buf_i) >= batch_size:
             flush()
     flush()
-
-    if not feats:
-        return torch.empty(0, BACKBONE_DIM), torch.empty(0, dtype=torch.long)
-    return torch.cat(feats), torch.tensor(labels, dtype=torch.long)
+    bank.flush()
+    return n
 
 
-@torch.no_grad()
 def _embed(fe: "PokemonFeatureExtractor", X: torch.Tensor, bs: int = 2048) -> torch.Tensor:
-    out = [F.normalize(fe.projection(X[i:i + bs]), p=2, dim=1) for i in range(0, X.size(0), bs)]
+    """Vectorised projection over an in-RAM (N, 1280) fp32 tensor."""
+    with torch.no_grad():
+        out = [F.normalize(fe.projection(X[i:i + bs]), p=2, dim=1) for i in range(0, X.size(0), bs)]
     return torch.cat(out) if out else torch.empty(0, 256)
 
 
 @torch.no_grad()
-def _evaluate(model: "PokemonClassifier", Etr, ytr, Xv, yv) -> Tuple[float, float]:
+def _embed_bank(fe: "PokemonFeatureExtractor", bank: "FeatureBank", bs: int = 2048) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Embeds a whole FeatureBank through `fe.projection` and returns
+    (embedding_tensor [N, 256] fp32 CPU, labels [N] long CPU). Reads the
+    bank in batches so peak RAM here is one batch of (B, 1280) + one batch
+    of (B, 256), not the whole (N, 256).
+    """
+    E_list: List[torch.Tensor] = []
+    y_list: List[torch.Tensor] = []
+    for xb, idx, yb in bank.iter_batches(bs, shuffle=False):
+        E_list.append(F.normalize(fe.projection(xb), p=2, dim=1))
+        y_list.append(yb)
+    if not E_list:
+        return torch.empty(0, 256), torch.empty(0, dtype=torch.long)
+    return torch.cat(E_list), torch.cat(y_list)
+
+
+@torch.no_grad()
+def _evaluate(model: "PokemonClassifier", Etr, ytr, Ev, yv) -> Tuple[float, float]:
     """
     Returns (classifier top-1 %, retrieval 1-NN %) on the held-out set.
     Retrieval = nearest stored training embedding by cosine similarity, which
     is how the bot actually uses the DB, so that's what we select on.
     """
-    if Xv.size(0) == 0:
+    if Ev.size(0) == 0:
         return 0.0, 0.0
-    Ev = _embed(model.feature_extractor, Xv)
     cls_acc = (model.classifier(Ev).argmax(1) == yv).float().mean().item() * 100
     correct = 0
     for i in range(0, Ev.size(0), 512):
@@ -1485,13 +1637,19 @@ def _evaluate(model: "PokemonClassifier", Etr, ytr, Xv, yv) -> Tuple[float, floa
     return cls_acc, 100 * correct / Ev.size(0)
 
 
-def train_head(model: "PokemonClassifier", Xtr, ytr, Xv, yv) -> float:
+def train_head(model: "PokemonClassifier", train_bank: "FeatureBank",
+               val_bank: "FeatureBank") -> float:
     """
-    Trains projection + classifier on cached backbone features with proper
-    shuffling. The old loop fed the head images in the cache's on-disk order
-    (grouped species by species), so every 20-image batch was ~1 class and
-    the head could only chase "whatever class is current" - loss stayed at
-    ln(1119) ≈ 7.0 forever no matter what the model or LR was.
+    Trains projection + classifier on the cached backbone features stored in
+    `train_bank` (memmap on disk), validating against `val_bank`.
+
+    Every epoch:
+      - iterates train_bank in shuffled batches. Each batch is read from
+        disk on demand and pushed through `fe.projection` on DEVICE with
+        grad enabled. Only one batch is ever in RAM.
+      - computes the val metrics by embedding the full train bank ONCE
+        (this is what makes 1-NN retrieval cheap and is done inside
+        _embed_bank, in batches, so peak RAM is one batch at a time).
     Leaves the BEST epoch's weights loaded in `model`; returns its val
     retrieval accuracy.
     """
@@ -1501,26 +1659,31 @@ def train_head(model: "PokemonClassifier", Xtr, ytr, Xv, yv) -> float:
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(HEAD_EPOCHS, 1))
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-    N = Xtr.size(0)
-    has_val = Xv.size(0) > 0
+    N = len(train_bank)
+    has_val = len(val_bank) > 0
     if not has_val:
         log.warning("   ⚠️ No held-out validation set - training all epochs and keeping the last one")
+
+    # Val bank is small (~2 images/species), safe to embed once up front.
+    if has_val:
+        Ev, yv = _embed_bank(fe, val_bank, bs=2048)
+    else:
+        Ev, yv = torch.empty(0, 256), torch.empty(0, dtype=torch.long)
 
     best_acc, best_epoch, best_state, stale = -1.0, 0, None, 0
 
     for epoch in range(HEAD_EPOCHS):
         t0 = time.time()
-        # projection + classifier have no BatchNorm; the (frozen) backbone
-        # never runs here, so nothing can drift.
         fe.projection.train()
         model.classifier.train()
 
-        perm = torch.randperm(N)
         loss_sum, correct = 0.0, 0
-        for i in range(0, N, HEAD_BATCH):
-            idx = perm[i:i + HEAD_BATCH]
-            xb = F.dropout(Xtr[idx], p=HEAD_FEATURE_DROPOUT, training=True)
-            yb = yb = ytr[idx]
+        # shuffle=True makes iter_batches build a per-epoch permutation and
+        # fancy-index the memmap -> only the current batch lands in RAM.
+        for xb, idx, yb in train_bank.iter_batches(HEAD_BATCH, shuffle=True, seed=epoch):
+            xb = xb.to(DEVICE)
+            yb = yb.to(DEVICE)
+            xb = F.dropout(xb, p=HEAD_FEATURE_DROPOUT, training=True)
             emb = F.normalize(fe.projection(xb), p=2, dim=1)
             logits = model.classifier(emb)
             loss = criterion(logits, yb)
@@ -1531,12 +1694,19 @@ def train_head(model: "PokemonClassifier", Xtr, ytr, Xv, yv) -> float:
             correct += (logits.argmax(1) == yb).sum().item()
         scheduler.step()
 
+        # Evaluate. Embed the whole train bank once for the 1-NN retrieval
+        # metric; this is done in batches inside _embed_bank, so peak RAM
+        # is one batch, not the (N, 256) result.
         fe.projection.eval()
         model.classifier.eval()
-        Etr = _embed(fe, Xtr)
-        cls_acc, ret_acc = _evaluate(model, Etr, ytr, Xv, yv)
-        log.info(f"   📊 Epoch {epoch + 1}/{HEAD_EPOCHS}: loss {loss_sum / N:.3f}, "
-                 f"train acc {100 * correct / N:.1f}%, val acc {cls_acc:.1f}%, "
+        if has_val:
+            Etr, ytr = _embed_bank(fe, train_bank, bs=2048)
+            cls_acc, ret_acc = _evaluate(model, Etr, ytr, Ev, yv)
+            del Etr, ytr
+        else:
+            cls_acc, ret_acc = 0.0, 0.0
+        log.info(f"   📊 Epoch {epoch + 1}/{HEAD_EPOCHS}: loss {loss_sum / max(N, 1):.3f}, "
+                 f"train acc {100 * correct / max(N, 1):.1f}%, val acc {cls_acc:.1f}%, "
                  f"val retrieval {ret_acc:.1f}% ({time.time() - t0:.1f}s)")
 
         score = ret_acc if has_val else float(epoch)
@@ -1550,30 +1720,48 @@ def train_head(model: "PokemonClassifier", Xtr, ytr, Xv, yv) -> float:
                          f"(best: {best_acc:.1f}% at epoch {best_epoch}), stopping")
                 break
 
+        gc.collect()
+        _trim_memory()
+
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
     return best_acc if has_val else 0.0
 
 
-def write_features_to_db(model: "PokemonClassifier", Xtr, ytr, dataset, db):
+def write_features_to_db(model: "PokemonClassifier", train_bank: "FeatureBank",
+                         dataset, db):
     """
     Re-embeds every training image with the FINAL (best) model and writes
     the vectors to the DB, so the DB always matches the saved model.
+
+    Reads train_bank in batches, so the (N, 256) embedding matrix for the
+    whole training set never exists in RAM - only one batch's worth at a
+    time.
     """
     log.info("\n💾 Writing features to database...")
     t0 = time.time()
-    E = _embed(model.feature_extractor, Xtr).numpy()
+    fe = model.feature_extractor
+    fe.projection.eval()
+
     per_species: Dict[str, List[np.ndarray]] = {}
-    for emb, lbl in zip(E, ytr.tolist()):
-        species = dataset.idx_to_species.get(lbl)
-        if species:
-            per_species.setdefault(species, []).append(emb)
+    total = 0
+
+    for xb, idx, yb in train_bank.iter_batches(2048, shuffle=False):
+        with torch.no_grad():
+            emb = F.normalize(fe.projection(xb), p=2, dim=1).cpu().numpy()
+        for vec, lbl in zip(emb, yb.tolist()):
+            species = dataset.idx_to_species.get(lbl)
+            if species:
+                per_species.setdefault(species, []).append(vec)
+        total += emb.shape[0]
+        gc.collect()
+
     if REPLACE_DB_FEATURES:
         log.info("   🧹 Clearing old features first (REPLACE_DB_FEATURES=true)")
         db.clear_features()
     db.bulk_add_features(per_species)
-    log.info(f"   ✅ Stored {len(E)} features for {len(per_species)} species in {time.time() - t0:.0f}s")
+    log.info(f"   ✅ Stored {total} features for {len(per_species)} species in {time.time() - t0:.0f}s")
 
 
 def _detect_container_memory_limit_mb() -> Optional[float]:
@@ -1704,34 +1892,48 @@ def stream_train():
         p.requires_grad_(False)
 
     # ============ PHASE 1: FROZEN-BACKBONE FEATURES (one pass) ============
+    # Features go straight into a memmap file on disk. Peak RAM for the
+    # whole pass is one STREAM_BATCH_SIZE batch, not the entire dataset.
     log.info("\n🧊 Phase 1/3: embedding every image once with the frozen backbone...")
+    log.info(f"   💾 On-disk feature banks go to: {FEATURE_BANK_DIR}/")
     t0 = time.time()
     fe = model.feature_extractor
+    # Capacity is just an upper bound (100k rows); raising it costs nothing
+    # on disk because the file is sparse until written.
+    train_capacity = max(200_000, num_species * MAX_IMAGES_PER_SPECIES + 10_000)
+    val_capacity = max(20_000, num_species * max(VAL_IMAGES_PER_SPECIES, 1) + 5_000)
+    train_bank = FeatureBank("train", FEATURE_BANK_DIR, dim=BACKBONE_DIM, capacity=train_capacity)
+    val_bank = FeatureBank("val", FEATURE_BANK_DIR, dim=BACKBONE_DIM, capacity=val_capacity)
     total_hint = num_species * max(MAX_IMAGES_PER_SPECIES - VAL_IMAGES_PER_SPECIES, 0)
-    # PrefetchIterator overlaps Hugging Face streaming / disk reads with compute.
-    Xtr, ytr = build_feature_bank(PrefetchIterator(dataset, maxsize=STREAM_BATCH_SIZE * 2),
-                                  fe, STREAM_BATCH_SIZE, total_hint=total_hint, tag="train")
+    n_train = build_feature_bank(
+        PrefetchIterator(dataset, maxsize=STREAM_BATCH_SIZE * 2),
+        fe, train_bank, STREAM_BATCH_SIZE, total_hint=total_hint, tag="train",
+    )
     # The held-out set is only complete once the pass above has finished.
-    Xv, yv = build_feature_bank(dataset.get_val_set(), fe, STREAM_BATCH_SIZE, tag="val")
+    n_val = build_feature_bank(
+        dataset.get_val_set(), fe, val_bank, STREAM_BATCH_SIZE, tag="val",
+    )
     gc.collect()
     _trim_memory()
-    log.info(f"   ✅ {Xtr.size(0)} train + {Xv.size(0)} val images embedded in {time.time() - t0:.0f}s")
+    log.info(f"   ✅ {n_train} train + {n_val} val images embedded in {time.time() - t0:.0f}s")
     log_memory("after feature pass")
 
-    if Xtr.size(0) == 0:
+    if n_train == 0:
         log.error("❌ No training images were collected! Exiting.")
         db.close()
         return
+    ytr = train_bank.labels_tensor()
     seen = int(ytr.unique().numel())
+    del ytr
     if seen < num_species:
         log.warning(f"   ⚠️ Only {seen}/{num_species} species have training images")
 
     # ============ PHASE 2: TRAIN PROJECTION + CLASSIFIER ============
-    log.info(f"\n🎯 Phase 2/3: training head ({Xtr.size(0)} samples, {num_species} species, "
+    log.info(f"\n🎯 Phase 2/3: training head ({n_train} samples, {num_species} species, "
              f"{HEAD_EPOCHS} epochs max, lr {HEAD_LR}, batch {HEAD_BATCH})")
     log.info("-" * 60)
     t0 = time.time()
-    best_acc = train_head(model, Xtr, ytr, Xv, yv)
+    best_acc = train_head(model, train_bank, val_bank)
     log.info("-" * 60)
     log.info(f"   ✅ Head trained in {time.time() - t0:.0f}s (best val retrieval acc: {best_acc:.1f}%)")
 
@@ -1741,7 +1943,7 @@ def stream_train():
 
     # ============ PHASE 3: WRITE FEATURES TO DB ============
     log.info("\n🗄️ Phase 3/3: database")
-    write_features_to_db(model, Xtr, ytr, dataset, db)
+    write_features_to_db(model, train_bank, dataset, db)
 
     log.info("-" * 60)
     log.info(f"✅ Training complete!")
@@ -1757,6 +1959,21 @@ def stream_train():
     log.info("\n" + "=" * 60)
     log.info("✅ All done! Model is ready to use.")
     log.info("=" * 60)
+
+    # Clean up the on-disk feature banks now that their contents are in the DB.
+    # If you want to keep them (e.g. to re-run just the head training without
+    # re-streaming HF), comment this block out.
+    try:
+        train_bank.close()
+        val_bank.close()
+        for f in FEATURE_BANK_DIR.glob("*"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+        FEATURE_BANK_DIR.rmdir()
+    except Exception:
+        pass
 
     db.close()
 
