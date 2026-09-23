@@ -387,6 +387,15 @@ class Database:
             pass
         self._conn = self._connect()
 
+    def _rollback(self):
+        """Call after any failed statement. Postgres leaves the connection in an
+        aborted-transaction state until this runs; every later query on it would
+        otherwise fail with InFailedSqlTransaction, even unrelated ones."""
+        try:
+            self._conn.rollback()
+        except Exception:
+            pass
+
     def _create_tables(self):
         cursor = self._conn.cursor()
         cursor.execute("""
@@ -467,6 +476,9 @@ class Database:
                         last_updated = EXCLUDED.last_updated
                 """, (species, len(features)))
             self._conn.commit()
+        except Exception:
+            self._rollback()
+            raise
         finally:
             try:
                 cursor.close()
@@ -480,6 +492,9 @@ class Database:
             cursor.execute("DELETE FROM pokemon_features")
             cursor.execute("DELETE FROM species_info")
             self._conn.commit()
+        except Exception:
+            self._rollback()
+            raise
         finally:
             try:
                 cursor.close()
@@ -533,6 +548,9 @@ class Database:
                     params,
                 )
             self._conn.commit()
+        except Exception:
+            self._rollback()
+            raise
         finally:
             try:
                 cursor.close()
@@ -546,7 +564,7 @@ class Database:
         cursor.execute("SELECT COUNT(*) FROM species_info")
         total_species = cursor.fetchone()[0]
         cursor.close()
-        return {"total_features": total_features, "total_species": total_species, "use_turso": False}
+        return {"total_features": total_features, "total_species": total_species, "backend": "postgres"}
 
     def save_checkpoint_blob(self, data: bytes):
         """
@@ -589,6 +607,9 @@ class Database:
             for key in stale_keys:
                 cursor.execute("DELETE FROM training_metadata WHERE key = %s", (key,))
             self._conn.commit()
+        except Exception:
+            self._rollback()
+            raise
         finally:
             try:
                 cursor.close()
@@ -628,6 +649,9 @@ class Database:
                     return None
                 parts.append(base64.b64decode(r[0]))
             return b"".join(parts)
+        except Exception:
+            self._rollback()
+            raise
         finally:
             try:
                 cursor.close()
@@ -1728,7 +1752,7 @@ def stream_train():
     log.info(f"\n📊 Database Stats:")
     log.info(f"   Total species: {final_stats['total_species']}")
     log.info(f"   Total features: {final_stats['total_features']}")
-    log.info(f"   Using Turso: {final_stats['use_turso']}")
+    log.info(f"   DB backend: {final_stats['backend']}")
 
     log.info("\n" + "=" * 60)
     log.info("✅ All done! Model is ready to use.")
