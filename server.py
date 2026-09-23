@@ -119,7 +119,8 @@ _CHILD_TUNABLES = (
     "BATCH_SIZE", "STREAM_BATCH_SIZE", "MAX_SPECIES", "MAX_IMAGES_PER_SPECIES", "VAL_IMAGES_PER_SPECIES",
     "MAX_CACHE_IMAGES", "HEAD_EPOCHS", "HEAD_LR", "HEAD_BATCH", "HEAD_WEIGHT_DECAY", "HEAD_FEATURE_DROPOUT",
     "HEAD_PATIENCE", "DISK_CACHE", "DISK_CACHE_DIR", "REPLACE_DB_FEATURES", "AUTO_EXTRACT_ARCHIVES",
-    "DATASET_NAME", "MODEL_OUTPUT", "ONNX_MODEL_PATH", "DB_PATH", "TURSO_URL", "TURSO_AUTH_TOKEN", "HF_TOKEN",
+    "DATASET_NAME", "MODEL_OUTPUT", "ONNX_MODEL_PATH", "DB_PATH", "POSTGRES_DSN", "PGHOST", "PGPORT",
+    "PGUSER", "PGPASSWORD", "PGDATABASE", "HF_TOKEN",
 )
 
 
@@ -459,8 +460,8 @@ class Trainer:
         if not (APP_DIR / "Extra pokemons.zip").exists() and not (APP_DIR / "Extra pokemons").is_dir():
             w.append("No 'Extra pokemons.zip' or 'Extra pokemons/' found: the extra species will be missing "
                      "from the new model, and with REPLACE_DB_FEATURES=true they are removed from the bank.")
-        if not _env("TURSO_URL"):
-            w.append("TURSO_URL is not set: training writes to the local SQLite file DB_PATH.")
+        if not _env("POSTGRES_DSN") and not _env("PGHOST"):
+            w.append("Neither POSTGRES_DSN nor PGHOST is set: training will try libpq defaults and likely fail.")
         return w
 
     def start(self) -> dict:
