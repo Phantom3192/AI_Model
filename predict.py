@@ -14,9 +14,8 @@ Usage:
     python predict.py path/to/dir_of_images/
 
 Environment (same as train_model.py):
-    TURSO_URL, TURSO_AUTH_TOKEN   -> use Turso if set
-    DB_PATH                       -> else fall back to local SQLite file (default pokemon.db)
-    MODEL_OUTPUT                  -> path to the saved model (default models/pokemon_classifier.pt)
+    POSTGRES_DSN (or PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE) -> PostgreSQL connection
+    MODEL_OUTPUT                                                  -> path to the saved model
 """
 
 import os
@@ -57,14 +56,14 @@ def load_feature_bank(db: Database):
     cursor = db._conn.cursor()
     cursor.execute("SELECT species, variant_name, feature_vector FROM pokemon_features")
     rows = cursor.fetchall()
+    cursor.close()
     if not rows:
         sys.exit("❌ No features found in the database. Did training finish and write to the DB?")
 
     species_list = []
     vectors = []
     for row in rows:
-        # sqlite3.Row supports both index and key access; libsql rows are
-        # plain tuples, so index access works for either backend.
+        # psycopg2 rows are plain tuples, so index access works.
         species = row[0]
         feature_vector = row[2]
         species_list.append(species)
