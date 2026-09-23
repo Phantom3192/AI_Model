@@ -7,7 +7,6 @@ import os
 import sys
 import json
 import logging
-import sqlite3
 import time
 import zipfile
 import shutil
@@ -63,6 +62,8 @@ from torchvision import models
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
+
+import psycopg2
 
 # ============ SILENT LOGGER ============
 class SilentLogger:
@@ -184,8 +185,7 @@ class PrefetchIterator:
 
 # ============ CONFIGURATION ============
 
-TURSO_URL = os.getenv("TURSO_URL")
-TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+POSTGRES_DSN = os.getenv("POSTGRES_DSN")
 HF_TOKEN = os.getenv("HF_TOKEN")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))  # Increased for streaming
 STREAM_BATCH_SIZE = int(os.getenv("STREAM_BATCH_SIZE", "20"))  # Images per stream batch - kept small so only one small chunk is ever in memory at a time
@@ -204,7 +204,7 @@ HEAD_PATIENCE = int(os.getenv("HEAD_PATIENCE", "15"))  # stop if val retrieval a
 REPLACE_DB_FEATURES = os.getenv("REPLACE_DB_FEATURES", "true").lower() == "true"
 DATASET_NAME = os.getenv("DATASET_NAME", "SpreadSheets/Poketwo-Spawn-Images")
 MODEL_OUTPUT = os.getenv("MODEL_OUTPUT", "models/pokemon_classifier.pt")
-DB_PATH = os.getenv("DB_PATH", "pokemon.db")
+DB_PATH = os.getenv("DB_PATH", "pokemon.db")  # kept for backwards compat; unused when POSTGRES_DSN is set
 AUTO_EXTRACT_ARCHIVES = os.getenv("AUTO_EXTRACT_ARCHIVES", "true").lower() == "true"
 MAX_SPECIES = int(os.getenv("MAX_SPECIES", "100"))  # Max species to train
 MAX_IMAGES_PER_SPECIES = int(os.getenv("MAX_IMAGES_PER_SPECIES", "10"))
@@ -358,35 +358,44 @@ def process_extracted_files(temp_dir: Path, extra_dir: Path) -> int:
 # ============ DATABASE LAYER ============
 
 class Database:
+    """
+    PostgreSQL-backed feature store.
+
+    Connection target (first one that resolves wins):
+      - POSTGRES_DSN, e.g. postgresql://user:pass@host:5432/dbname
+      - the standard libpq env vars PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE
+
+    Same public interface as before (add_pokemon_features_batch, clear_features,
+    bulk_add_features, get_stats, save_checkpoint_blob, load_checkpoint_blob, close).
+    """
+
     def __init__(self):
-        self.use_turso = False
-        self._conn = None
-        
-        if TURSO_URL:
-            try:
-                import libsql
-                self._conn = libsql.connect(TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
-                self.use_turso = True
-                log.info(f"✅ Connected to Turso database")
-            except Exception:
-                log.warning(f"Turso connection failed, using SQLite fallback")
-        
-        if not self.use_turso:
-            self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            log.info(f"✅ Using SQLite database: {DB_PATH}")
-        
+        self._conn = self._connect()
+        log.info("✅ Connected to PostgreSQL database")
         self._create_tables()
-    
+
+    def _connect(self):
+        if POSTGRES_DSN:
+            return psycopg2.connect(POSTGRES_DSN)
+        # Fall back to libpq's own env vars (PGHOST, PGUSER, ...).
+        return psycopg2.connect()
+
+    def _reconnect(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+        self._conn = self._connect()
+
     def _create_tables(self):
         cursor = self._conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS pokemon_features (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 species TEXT NOT NULL,
                 variant_name TEXT NOT NULL,
                 feature_vector TEXT NOT NULL,
-                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM now())::bigint),
                 UNIQUE(species, variant_name)
             )
         """)
@@ -394,19 +403,20 @@ class Database:
             CREATE TABLE IF NOT EXISTS species_info (
                 species TEXT PRIMARY KEY,
                 count INTEGER DEFAULT 0,
-                last_updated INTEGER DEFAULT (strftime('%s', 'now'))
+                last_updated BIGINT DEFAULT (EXTRACT(EPOCH FROM now())::bigint)
             )
         """)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS training_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT,
-                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+                updated_at BIGINT DEFAULT (EXTRACT(EPOCH FROM now())::bigint)
             )
         """)
         self._conn.commit()
+        cursor.close()
         log.info("✅ Database tables ready")
-    
+
     def add_pokemon_features(self, species: str, features: List[np.ndarray], 
                              variant_names: List[str] = None):
         self.add_pokemon_features_batch({species: features})
@@ -435,23 +445,26 @@ class Database:
                 if not features:
                     continue
                 cursor.execute(
-                    "SELECT COUNT(*) FROM pokemon_features WHERE species = ?", (species,)
+                    "SELECT COUNT(*) FROM pokemon_features WHERE species = %s", (species,)
                 )
                 existing_count = cursor.fetchone()[0]
                 variant_names = [f"{species}_{existing_count + i + 1}" for i in range(len(features))]
                 for i, feature in enumerate(features):
                     feature_json = json.dumps(feature.tolist())
                     cursor.execute("""
-                        INSERT OR REPLACE INTO pokemon_features 
+                        INSERT INTO pokemon_features 
                         (species, variant_name, feature_vector, created_at)
-                        VALUES (?, ?, ?, strftime('%s', 'now'))
+                        VALUES (%s, %s, %s, EXTRACT(EPOCH FROM now())::bigint)
+                        ON CONFLICT (species, variant_name) DO UPDATE SET
+                            feature_vector = EXCLUDED.feature_vector,
+                            created_at = EXCLUDED.created_at
                     """, (species, variant_names[i], feature_json))
                 cursor.execute("""
                     INSERT INTO species_info (species, count, last_updated)
-                    VALUES (?, ?, strftime('%s', 'now'))
+                    VALUES (%s, %s, EXTRACT(EPOCH FROM now())::bigint)
                     ON CONFLICT(species) DO UPDATE SET
-                        count = count + excluded.count,
-                        last_updated = excluded.last_updated
+                        count = species_info.count + EXCLUDED.count,
+                        last_updated = EXCLUDED.last_updated
                 """, (species, len(features)))
             self._conn.commit()
         finally:
@@ -493,11 +506,14 @@ class Database:
             n_stmts = 0
             for i in range(0, len(rows), rows_per_stmt):
                 chunk = rows[i:i + rows_per_stmt]
-                placeholders = ",".join(["(?, ?, ?, strftime('%s', 'now'))"] * len(chunk))
+                placeholders = ",".join(["(%s, %s, %s, EXTRACT(EPOCH FROM now())::bigint)"] * len(chunk))
                 params = tuple(v for row in chunk for v in row)
                 cursor.execute(
-                    "INSERT OR REPLACE INTO pokemon_features "
-                    "(species, variant_name, feature_vector, created_at) VALUES " + placeholders,
+                    "INSERT INTO pokemon_features "
+                    "(species, variant_name, feature_vector, created_at) VALUES " + placeholders +
+                    " ON CONFLICT (species, variant_name) DO UPDATE SET "
+                    "feature_vector = EXCLUDED.feature_vector, "
+                    "created_at = EXCLUDED.created_at",
                     params,
                 )
                 n_stmts += 1
@@ -508,12 +524,12 @@ class Database:
             items = [(sp, len(f)) for sp, f in species_to_features.items() if f]
             for i in range(0, len(items), 100):
                 chunk = items[i:i + 100]
-                placeholders = ",".join(["(?, ?, strftime('%s', 'now'))"] * len(chunk))
+                placeholders = ",".join(["(%s, %s, EXTRACT(EPOCH FROM now())::bigint)"] * len(chunk))
                 params = tuple(v for row in chunk for v in row)
                 cursor.execute(
                     "INSERT INTO species_info (species, count, last_updated) VALUES " + placeholders +
-                    " ON CONFLICT(species) DO UPDATE SET count = excluded.count, "
-                    "last_updated = excluded.last_updated",
+                    " ON CONFLICT(species) DO UPDATE SET count = EXCLUDED.count, "
+                    "last_updated = EXCLUDED.last_updated",
                     params,
                 )
             self._conn.commit()
@@ -529,7 +545,8 @@ class Database:
         total_features = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM species_info")
         total_species = cursor.fetchone()[0]
-        return {"total_features": total_features, "total_species": total_species, "use_turso": self.use_turso}
+        cursor.close()
+        return {"total_features": total_features, "total_species": total_species, "use_turso": False}
 
     def save_checkpoint_blob(self, data: bytes):
         """
@@ -544,26 +561,33 @@ class Database:
             for i, chunk in enumerate(chunks):
                 b64 = base64.b64encode(chunk).decode("ascii")
                 cursor.execute("""
-                    INSERT OR REPLACE INTO training_metadata (key, value, updated_at)
-                    VALUES (?, ?, strftime('%s', 'now'))
+                    INSERT INTO training_metadata (key, value, updated_at)
+                    VALUES (%s, %s, EXTRACT(EPOCH FROM now())::bigint)
+                    ON CONFLICT (key) DO UPDATE SET
+                        value = EXCLUDED.value,
+                        updated_at = EXCLUDED.updated_at
                 """, (f"checkpoint_chunk_{i:04d}", b64))
             # Meta row last, so a load never sees a meta count higher than
             # the chunks actually written (e.g. if this call dies partway).
             cursor.execute("""
-                INSERT OR REPLACE INTO training_metadata (key, value, updated_at)
-                VALUES ('checkpoint_meta', ?, strftime('%s', 'now'))
+                INSERT INTO training_metadata (key, value, updated_at)
+                VALUES ('checkpoint_meta', %s, EXTRACT(EPOCH FROM now())::bigint)
+                ON CONFLICT (key) DO UPDATE SET
+                    value = EXCLUDED.value,
+                    updated_at = EXCLUDED.updated_at
             """, (json.dumps({"chunks": len(chunks), "total_bytes": len(data)}),))
             # Clean up any leftover chunks from a PREVIOUS checkpoint that
             # had more chunks than this one (checkpoint size can shrink -
             # e.g. optimizer state changes) - otherwise a load would
             # wrongly append stale trailing bytes from an old save.
+            keep_keys = tuple(f"checkpoint_chunk_{i:04d}" for i in range(len(chunks)))
             cursor.execute("""
                 SELECT key FROM training_metadata 
-                WHERE key LIKE 'checkpoint_chunk_%' AND key NOT IN ({})
-            """.format(",".join("?" * len(chunks))), tuple(f"checkpoint_chunk_{i:04d}" for i in range(len(chunks))))
+                WHERE key LIKE 'checkpoint_chunk_%%' AND key NOT IN %s
+            """, (keep_keys,))
             stale_keys = [row[0] for row in cursor.fetchall()]
             for key in stale_keys:
-                cursor.execute("DELETE FROM training_metadata WHERE key = ?", (key,))
+                cursor.execute("DELETE FROM training_metadata WHERE key = %s", (key,))
             self._conn.commit()
         finally:
             try:
@@ -580,7 +604,7 @@ class Database:
             raise RuntimeError(
                 f"Checkpoint verification failed: wrote {len(data)} bytes, "
                 f"read back {got} bytes. The DB write likely did not "
-                f"actually persist (e.g. a Turso row/size limit)."
+                f"actually persist (e.g. a row/size limit)."
             )
 
     def load_checkpoint_blob(self) -> Optional[bytes]:
@@ -595,7 +619,7 @@ class Database:
             parts = []
             for i in range(num_chunks):
                 cursor.execute(
-                    "SELECT value FROM training_metadata WHERE key = ?",
+                    "SELECT value FROM training_metadata WHERE key = %s",
                     (f"checkpoint_chunk_{i:04d}",)
                 )
                 r = cursor.fetchone()
