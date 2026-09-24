@@ -209,6 +209,7 @@ class Engine:
         self.loaded_at: Optional[float] = None
         self.started_at = time.time()
         self._load_lock = threading.Lock()
+        self._fp_lock = threading.Lock()
         self.m_embed: Deque[float] = deque(maxlen=500)
         self.m_match: Deque[float] = deque(maxlen=500)
         self.n_predictions = 0
@@ -304,10 +305,14 @@ class Engine:
         with bank.lock:
             return self.extractor, bank._species, bank._matrix, bank.version
 
-    def _match(self, vec: np.ndarray, species_list, matrix):
-        """Cosine top-k (vectors are L2-normalised so it's a dot product) + majority vote."""
-        sims = matrix @ vec
-        k = min(self.s.top_k, sims.shape[0])
+    # Below this many images a plain matrix-vector product is as fast as a matrix-matrix one;
+    # from here on one BLAS matmul streams the (huge) bank from RAM once for the whole group
+    # instead of once per image (measured at 7 lakh x 256: 53 ms/img alone, ~28 at 4, ~15 at 8).
+    _GEMM_MIN = 3
+    _GEMM_MAX = 16  # keeps the (N, B) similarity block small
+
+    def _finish_match(self, sims: np.ndarray, species_list, k: int):
+        """Top-k of one similarity row + majority vote (the rules the old _match used)."""
         order = np.argpartition(-sims, k - 1)[:k]
         order = order[np.argsort(-sims[order])]
         neighbors = [(species_list[i], float(sims[i])) for i in order]
@@ -323,9 +328,26 @@ class Engine:
             winner, score = top_species, top_sim
         return winner, score, neighbors
 
-    def identify(self, images: List[bytes]) -> List[Optional[dict]]:
-        """Decode + embed all images in ONE model call, then match each. None = unreadable image."""
-        extractor, species_list, matrix, version = self.snapshot()
+    def _match(self, vec: np.ndarray, species_list, matrix):
+        """Cosine top-k (vectors are L2-normalised so it's a dot product) + majority vote."""
+        k = min(self.s.top_k, matrix.shape[0])
+        return self._finish_match(matrix @ vec, species_list, k)
+
+    def _match_many(self, vecs: List[np.ndarray], species_list, matrix):
+        k = min(self.s.top_k, matrix.shape[0])
+        if len(vecs) < self._GEMM_MIN:
+            return [self._finish_match(matrix @ v, species_list, k) for v in vecs]
+        out = []
+        for a in range(0, len(vecs), self._GEMM_MAX):
+            V = np.ascontiguousarray(np.stack(vecs[a:a + self._GEMM_MAX]), dtype=np.float32)
+            S = np.ascontiguousarray((matrix @ V.T).T)  # (b, N): one pass over the bank for b images
+            out.extend(self._finish_match(S[j], species_list, k) for j in range(S.shape[0]))
+        return out
+
+    def embed_many(self, images: List[bytes], snap=None):
+        """Decode + embed all images in ONE model call (no bank access).
+        Returns (vecs, embed_ms): vecs[i] is None for an unreadable image; embed_ms[i] is per-image ms."""
+        extractor = (snap or self.snapshot())[0]
         if extractor is None:
             raise RuntimeError("model not loaded")
 
@@ -339,26 +361,43 @@ class Engine:
 
         n_valid = sum(1 for im in pil if im is not None)
         t0 = time.perf_counter()
-        vecs = extractor.extract_batch(pil) if n_valid else np.zeros((len(pil), extractor.dim), np.float32)
+        arr = extractor.extract_batch(pil) if n_valid else np.zeros((len(pil), extractor.dim), np.float32)
         embed_ms = (time.perf_counter() - t0) * 1000 / max(1, n_valid)
 
-        out: List[Optional[dict]] = []
-        for im, vec in zip(pil, vecs):
+        vecs: List[Optional[np.ndarray]] = []
+        for im, vec in zip(pil, arr):
             if im is None or vec is None or float(np.linalg.norm(vec)) < 1e-6:
                 self.n_bad_images += 1
-                out.append(None)
-                continue
-            if matrix.shape[0] == 0:
-                raise EmptyBank()
-            t1 = time.perf_counter()
-            species, score, neighbors = self._match(vec, species_list, matrix)
-            match_ms = (time.perf_counter() - t1) * 1000
-            self.m_embed.append(embed_ms)
+                vecs.append(None)
+            else:
+                vecs.append(vec)
+        return vecs, [embed_ms] * len(pil)
+
+    def match_many(self, snap, vecs: List[Optional[np.ndarray]], embed_ms: List[float]) -> List[Optional[dict]]:
+        """Match embedded images against the bank snapshot they were embedded for (one batched matmul)."""
+        _, species_list, matrix, version = snap
+        valid = [i for i, v in enumerate(vecs) if v is not None]
+        out: List[Optional[dict]] = [None] * len(vecs)
+        if not valid:
+            return out
+        if matrix.shape[0] == 0:
+            raise EmptyBank()
+        t1 = time.perf_counter()
+        matches = self._match_many([vecs[i] for i in valid], species_list, matrix)
+        match_ms = (time.perf_counter() - t1) * 1000 / len(valid)
+        for i, (species, score, neighbors) in zip(valid, matches):
+            self.m_embed.append(embed_ms[i])
             self.m_match.append(match_ms)
             self.n_predictions += 1
-            out.append({"species": species, "score": score, "neighbors": neighbors, "vec": vec,
-                        "embed_ms": embed_ms, "match_ms": match_ms, "bank_version": version})
+            out[i] = {"species": species, "score": score, "neighbors": neighbors, "vec": vecs[i],
+                      "embed_ms": embed_ms[i], "match_ms": match_ms, "bank_version": version}
         return out
+
+    def identify(self, images: List[bytes]) -> List[Optional[dict]]:
+        """Decode + embed all images in ONE model call, then match them together. None = unreadable image."""
+        snap = self.snapshot()
+        vecs, embed_ms = self.embed_many(images, snap)
+        return self.match_many(snap, vecs, embed_ms)
 
     def embed_one(self, image: bytes) -> Optional[np.ndarray]:
         extractor = self.extractor
@@ -379,24 +418,44 @@ class Engine:
         return {"n": len(v), "p50": round(float(np.percentile(v, 50)), 2),
                 "p95": round(float(np.percentile(v, 95)), 2)}
 
-    def _bank_fingerprint(self, species, matrix, version) -> str:
+    _FP_BLOCK = 4096
+
+    @staticmethod
+    def _fp_block(h, species, matrix, a: int, b: int):
+        h.update(("\n".join(species[a:b]) + "\n").encode())
+        h.update(memoryview(matrix[a:b]))   # no bytes copy of the block
+
+    def _bank_fingerprint(self, species, matrix, version, generation: int = 0) -> str:
         """Content hash of model + feature bank, so a client can tell if its saved results are still valid
-        (unlike bank_version, it survives server restarts). Computed once per bank version."""
-        cached = getattr(self, "_fp_cache", None)
-        if cached and cached[0] == version:
-            return cached[1]
-        h = hashlib.sha1()
-        h.update(str(self.model_id).encode())
-        h.update("\n".join(species).encode())
-        h.update(np.ascontiguousarray(matrix).tobytes())
-        fp = h.hexdigest()[:16]
-        self._fp_cache = (version, fp)
-        return fp
+        (unlike bank_version, it survives server restarts). Learning only appends rows, so the hash of all
+        full 4096-row blocks is kept and only the new rows are hashed: cheap after each learn."""
+        with self._fp_lock:
+            cached = getattr(self, "_fp_cache", None)
+            if cached and cached[0] == version:
+                return cached[1]
+            n, B = int(matrix.shape[0]), self._FP_BLOCK
+            st = getattr(self, "_fp_state", None)   # (generation, rows_hashed, running sha1)
+            if st is None or st[0] != generation or st[1] > n:
+                h = hashlib.sha1()
+                h.update(str(self.model_id).encode())
+                done = 0
+            else:
+                _, done, h = st
+            full = (n // B) * B
+            for a in range(done, full, B):
+                self._fp_block(h, species, matrix, a, a + B)
+            self._fp_state = (generation, full, h)
+            t = h.copy()
+            if full < n:
+                self._fp_block(t, species, matrix, full, n)
+            fp = t.hexdigest()[:16]
+            self._fp_cache = (version, fp)
+            return fp
 
     def health(self) -> dict:
-        species, matrix, version = ([], np.zeros((0, 0)), 0)
+        species, matrix, version, generation = ([], np.zeros((0, 0)), 0, 0)
         if self.bank is not None:
-            species, matrix, version = self.bank.snapshot_versioned()
+            species, matrix, version, generation = self.bank.snapshot_gen()
         return {
             "status": "ok" if self.ready else "not_ready",
             "ready": self.ready,
@@ -405,9 +464,9 @@ class Engine:
             "backend": self.backend,
             "model": self.model_id,
             "vectors": int(matrix.shape[0]),
-            "species": len(set(species)),
+            "species": self.bank.species_count if self.bank is not None else 0,
             "bank_version": version,
-            "bank_fingerprint": self._bank_fingerprint(species, matrix, version) if len(species) else None,
+            "bank_fingerprint": self._bank_fingerprint(species, matrix, version, generation) if matrix.shape[0] else None,
             "bank_backend": self.bank.backend if self.bank else None,
             "bank_dir": BANK_DIR,
             "uptime_s": int(time.time() - self.started_at),
@@ -720,6 +779,15 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[DiskFeatureBa
         async with infer_sem:
             return await run_in_threadpool(fn, *args)
 
+    async def identify_chunks(chunks: List[List[bytes]]) -> List[Optional[dict]]:
+        """Embed the chunks in parallel (one per free inference slot), then match ALL images in one
+        batched pass over the bank. One snapshot keeps model and bank consistent across a reload."""
+        snap = engine.snapshot()
+        parts = await asyncio.gather(*(infer(engine.embed_many, c, snap) for c in chunks))
+        vecs = [v for p in parts for v in p[0]]
+        ms = [m for p in parts for m in p[1]]
+        return await infer(engine.match_many, snap, vecs, ms)
+
     def public(result: dict, threshold: float, include_embedding: bool) -> dict:
         body = {
             "species": result["species"],
@@ -737,7 +805,7 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[DiskFeatureBa
     # ------------------------------------------------------ routes
     @app.get("/health")
     async def health():
-        body = engine.health()
+        body = await run_in_threadpool(engine.health)   # may hash new bank rows: keep it off the event loop
         return JSONResponse(body, status_code=200 if engine.ready else 503)
 
     @app.post("/v1/predict", dependencies=[Depends(require_key)])
@@ -769,8 +837,7 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[DiskFeatureBa
         chunks = [blobs[i:i + s.infer_chunk] for i in range(0, len(blobs), s.infer_chunk)]
         try:
             async with admitted(len(blobs)):
-                parts = await asyncio.gather(*(infer(engine.identify, c) for c in chunks))
-            results = [r for part in parts for r in part]
+                results = await identify_chunks(chunks)
         except EmptyBank:
             raise HTTPException(503, "the feature bank is empty - train first")
         th = s.confidence_threshold if threshold is None else threshold
@@ -814,10 +881,9 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[DiskFeatureBa
                 blobs = [g[1] for g in good]
                 chunks = [blobs[i:i + s.infer_chunk] for i in range(0, len(blobs), s.infer_chunk)]
                 try:
-                    parts = await asyncio.gather(*(infer(engine.identify, c) for c in chunks))
+                    results = await identify_chunks(chunks)
                 except EmptyBank:
                     raise HTTPException(503, "the feature bank is empty - train first")
-                results = [r for part in parts for r in part]
                 for (i, data, ms), r in zip(good, results):
                     if r is None:
                         out[i] = {"ok": False, "code": "unreadable", "error": "could not read that image"}
