@@ -1,45 +1,40 @@
 """
 predict.py - Use the trained Pokemon classifier to identify a species from an image.
 
-How it works:
-    1. Loads the trained EfficientNet-B0 feature extractor from models/pokemon_classifier.pt
-    2. Embeds the query image into the same 256-dim vector space used at training time
-    3. Loads every stored per-image embedding from the DB (pokemon_features table)
-    4. Finds the closest matches by cosine similarity and returns a majority vote
-       over the top-k neighbors (more robust than a single nearest neighbor)
+Loads the ONNX/Torch model from models/pokemon_classifier.pt and the feature bank
+from bank/ (same files the API server uses). No database involved.
 
 Usage:
     python predict.py path/to/image.jpg
     python predict.py path/to/image.jpg --top 10 --show-all
     python predict.py path/to/dir_of_images/
 
-Environment (same as train_model.py):
-    POSTGRES_DSN (or PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE) -> PostgreSQL connection
-    MODEL_OUTPUT                                                  -> path to the saved model
+Environment:
+    MODEL_OUTPUT  -> path to the saved model (default models/pokemon_classifier.pt)
+    BANK_DIR      -> feature bank directory (default bank)
 """
 
 import os
 import sys
-import json
 import glob
 import argparse
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
 
-# Reuse the exact classes/constants train_model.py uses, so preprocessing and
-# DB access stay identical between training and inference.
-from train_model import PokemonFeatureExtractor, Database, MODEL_OUTPUT
+from train_model import PokemonFeatureExtractor, MODEL_OUTPUT
 
+BANK_DIR = Path(os.getenv("BANK_DIR", "bank"))
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
 def load_extractor(model_path: str) -> PokemonFeatureExtractor:
     if not os.path.exists(model_path):
         sys.exit(f"❌ Model file not found: {model_path}\n"
-                  f"   Run train_model.py first, or pass --model to point at the right file.")
+                 f"   Run train_model.py first, or pass --model to point at the right file.")
     extractor = PokemonFeatureExtractor(embedding_dim=256)
     state_dict = torch.load(model_path, map_location="cpu")
     extractor.load_state_dict(state_dict)
@@ -47,43 +42,46 @@ def load_extractor(model_path: str) -> PokemonFeatureExtractor:
     return extractor
 
 
-def load_feature_bank(db: Database):
-    """
-    Pulls every stored (species, vector) pair once into memory as a single
-    NumPy matrix, so a lookup is one matrix multiply instead of N per-row
-    queries. Cache this across multiple predictions in the same run.
-    """
-    cursor = db._conn.cursor()
-    cursor.execute("SELECT species, variant_name, feature_vector FROM pokemon_features")
-    rows = cursor.fetchall()
-    cursor.close()
-    if not rows:
-        sys.exit("❌ No features found in the database. Did training finish and write to the DB?")
+def load_feature_bank(bank_dir: Path):
+    features_path = bank_dir / "base_features.npy"
+    species_path = bank_dir / "base_species.npy"
+    if not features_path.exists() or not species_path.exists():
+        sys.exit(f"❌ Feature bank not found in {bank_dir}/. Run train_model.py first.")
 
-    species_list = []
-    vectors = []
-    for row in rows:
-        # psycopg2 rows are plain tuples, so index access works.
-        species = row[0]
-        feature_vector = row[2]
-        species_list.append(species)
-        vectors.append(json.loads(feature_vector))
+    matrix = np.load(features_path).astype(np.float32)
+    species_arr = np.load(species_path, allow_pickle=False)
+    species_list = [str(s) for s in species_arr]
 
-    matrix = np.asarray(vectors, dtype=np.float32)  # (N, 256), already L2-normalized at write time
+    # Fold in learned.jsonl if present
+    learned_path = bank_dir / "learned.jsonl"
+    if learned_path.exists():
+        import json, base64
+        learned_species = []
+        learned_vecs = []
+        with learned_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    vec = np.frombuffer(base64.b64decode(row["vec"]), dtype=np.float32).copy()
+                    learned_species.append(row["species"])
+                    learned_vecs.append(vec)
+                except Exception:
+                    continue
+        if learned_vecs:
+            species_list += learned_species
+            matrix = np.concatenate([matrix, np.stack(learned_vecs)], axis=0)
+            print(f"   (also loaded {len(learned_vecs)} learned examples from learned.jsonl)")
+
     return species_list, matrix
 
 
 def predict_species(query_vec: np.ndarray, species_list, matrix: np.ndarray, top_k: int = 5):
-    """
-    Cosine similarity == plain dot product here since every stored vector
-    (and the query vector) is already L2-normalized.
-    """
-    sims = matrix @ query_vec  # (N,)
+    sims = matrix @ query_vec
     order = np.argsort(-sims)[:top_k]
-
     neighbors = [(species_list[i], float(sims[i])) for i in order]
-
-    # Majority vote across the top-k neighbors, tie-broken by best single similarity
     votes = Counter(sp for sp, _ in neighbors)
     winner, _ = max(
         votes.items(),
@@ -105,16 +103,16 @@ def main():
     parser = argparse.ArgumentParser(description="Identify a Pokemon species from an image.")
     parser.add_argument("image_path", help="Path to an image file, or a directory of images")
     parser.add_argument("--model", default=MODEL_OUTPUT, help="Path to the trained model file")
+    parser.add_argument("--bank", default=str(BANK_DIR), help="Feature bank directory")
     parser.add_argument("--top", type=int, default=5, help="Number of nearest neighbors to vote over")
-    parser.add_argument("--show-all", action="store_true", help="Print all top-k neighbors, not just the winner")
+    parser.add_argument("--show-all", action="store_true", help="Print all top-k neighbors")
     args = parser.parse_args()
 
     print(f"📦 Loading model from {args.model} ...")
     extractor = load_extractor(args.model)
 
-    print("🗄️  Connecting to database and loading feature bank ...")
-    db = Database()
-    species_list, matrix = load_feature_bank(db)
+    print(f"🗄️  Loading feature bank from {args.bank}/ ...")
+    species_list, matrix = load_feature_bank(Path(args.bank))
     print(f"   Loaded {matrix.shape[0]} feature vectors across {len(set(species_list))} species\n")
 
     for img_path in iter_image_paths(args.image_path):
@@ -133,8 +131,6 @@ def main():
             for sp, sim in neighbors:
                 print(f"      {sp:<20s} {sim:.3f}")
         print()
-
-    db.close()
 
 
 if __name__ == "__main__":
