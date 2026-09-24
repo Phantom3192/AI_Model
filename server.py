@@ -1,25 +1,24 @@
 """
 server.py - AI_Model: the Pokémon identifier as an HTTP API.
 
-The Discord bot no longer needs the model, torch, or the database. It sends an image to this
-service and gets back the species:
-
     POST /v1/predict          one image  -> species, score, top neighbours
-    POST /v1/predict/batch    N images   -> one result per image (single model call)
-    POST /v1/learn            teach it a new example (from an image or a returned embedding)
-    POST /v1/forget           delete learned examples ({"species": ...} or {"last": true})
+    POST /v1/predict/batch    N images   -> one result per image
+    POST /v1/predict/urls     N urls     -> one result per image (server fetches)
+    POST /v1/learn            teach a new example
+    POST /v1/learn/batch      teach many examples in one request
+    POST /v1/forget           delete learned examples
     GET  /v1/stats            bank size + latency numbers
-    GET  /health              readiness (no auth, 503 until the model + bank are loaded)
+    GET  /health              readiness
     POST /admin/reload        re-read model + feature bank
-    POST /admin/train         start a training run in a subprocess (needs API_KEY set)
-    GET  /admin/train/status  progress / log tail of the run
+    POST /admin/train         start a training run in a subprocess
+    GET  /admin/train/status  progress / log tail
     POST /admin/train/stop    abort the run
 
-Inference runs on ONNX Runtime, so this process never imports torch. torch is only used by the
-subprocesses that train or (re-)export the model.
+Feature bank: purely file-backed (bank/base_features.npy + base_species.npy).
+Learned examples live in bank/learned.jsonl. There is no database anywhere.
 
-Run:   python server.py            (or: uvicorn server:app --host 0.0.0.0 --port 8000)
-Keep it at ONE worker process: the feature bank lives in this process's memory.
+Inference runs on ONNX Runtime, so this process never imports torch. torch is
+only used by the subprocesses that train or (re-)export the model.
 """
 
 import io
@@ -56,7 +55,8 @@ except ImportError:
 # default every concurrent request spins up (and busy-waits) a thread per host core: it burns CPU and
 # slows the real work. Parallelism here comes from INFER_CONCURRENCY slots instead. Child processes
 # (training / ONNX export) get the original values back, see child_env().
-_BLAS_VARS = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
+_BLAS_VARS = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+              "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
 _BLAS_ORIG = {k: os.environ.get(k) for k in _BLAS_VARS}
 for _k in _BLAS_VARS:
     os.environ[_k] = "1"
@@ -68,8 +68,9 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from feature_bank import FeatureBank, new_species_name, species_key
+from disk_bank import DiskFeatureBank, new_species_name, species_key  # noqa: F401
 
+BANK_DIR = os.getenv("BANK_DIR", "bank")
 APP_DIR = Path(__file__).resolve().parent
 
 log = logging.getLogger("ai_model")
@@ -113,14 +114,12 @@ def _env_bool(name: str, default: bool) -> bool:
     return _env(name, str(default)).lower() in ("1", "true", "yes", "on")
 
 
-# Settings that train_model.py / export_onnx.py read with a bare int()/float() on os.environ.
-# They can't be changed, so child processes get a cleaned copy of these (see child_env()).
 _CHILD_TUNABLES = (
     "BATCH_SIZE", "STREAM_BATCH_SIZE", "MAX_SPECIES", "MAX_IMAGES_PER_SPECIES", "VAL_IMAGES_PER_SPECIES",
     "MAX_CACHE_IMAGES", "HEAD_EPOCHS", "HEAD_LR", "HEAD_BATCH", "HEAD_WEIGHT_DECAY", "HEAD_FEATURE_DROPOUT",
-    "HEAD_PATIENCE", "DISK_CACHE", "DISK_CACHE_DIR", "REPLACE_DB_FEATURES", "AUTO_EXTRACT_ARCHIVES",
-    "DATASET_NAME", "MODEL_OUTPUT", "ONNX_MODEL_PATH", "DB_PATH", "POSTGRES_DSN", "PGHOST", "PGPORT",
-    "PGUSER", "PGPASSWORD", "PGDATABASE", "HF_TOKEN",
+    "HEAD_PATIENCE", "DISK_CACHE", "DISK_CACHE_DIR", "AUTO_EXTRACT_ARCHIVES",
+    "DATASET_NAME", "MODEL_OUTPUT", "ONNX_MODEL_PATH", "HF_TOKEN",
+    "BANK_DIR", "BANK_DTYPE", "FEATURE_BANK_DIR",
 )
 
 
@@ -129,7 +128,7 @@ def child_env(**extra) -> dict:
     for k in _CHILD_TUNABLES:
         if k in env:
             env[k] = _env(k)
-    for k, v in _BLAS_ORIG.items():  # training/export should keep their own thread settings
+    for k, v in _BLAS_ORIG.items():
         if v is None:
             env.pop(k, None)
         else:
@@ -171,16 +170,9 @@ class Settings:
     model_path: str = field(default_factory=lambda: _env("MODEL_OUTPUT", "models/pokemon_classifier.pt"))
     onnx_path: str = field(default_factory=lambda: _env("ONNX_MODEL_PATH"))
     auto_export_onnx: bool = field(default_factory=lambda: _env_bool("AUTO_EXPORT_ONNX", True))
-    # Intra-op threads per inference call. CORES lets one lone spawn finish fastest, but under
-    # concurrent load every request fights over the same fixed pool of CORES threads instead of
-    # each request getting its own core - set ONNX_THREADS=1 to let infer_concurrency (below) use
-    # the cores across *different* requests in parallel instead, which scales far better under load.
     onnx_threads: int = field(default_factory=lambda: _env_int("ONNX_THREADS", CORES))
-    # Concurrent inference slots. CORES*8 is a good default only when onnx_threads=1 (each slot
-    # uses one core independently). If you raise ONNX_THREADS, lower this to roughly CORES /
-    # ONNX_THREADS so slots don't oversubscribe the same physical cores. Override directly if tuning.
     infer_concurrency: int = field(default_factory=lambda: _env_int("INFER_CONCURRENCY", CORES * 8))
-    max_pending: int = CORES * 128            # images allowed to wait for a slot; beyond that -> 503 "busy" (protects RAM)
+    max_pending: int = CORES * 128
     infer_chunk: int = 2
     top_k: int = field(default_factory=lambda: max(1, _env_int("TOP_K", 5)))
     near_exact_sim: float = field(default_factory=lambda: _env_float("NEAR_EXACT_SIM", 0.95))
@@ -201,13 +193,13 @@ class Settings:
         return int(self.max_upload_mb * 1024 * 1024)
 
 
-# ============================================================ engine (model + bank)
+# ============================================================ engine
 class Engine:
     """Owns the ONNX extractor and the feature bank, and swaps them together on reload."""
 
-    def __init__(self, settings: Settings, bank: Optional[FeatureBank] = None):
+    def __init__(self, settings: Settings, bank: Optional[DiskFeatureBank] = None):
         self.s = settings
-        self.bank: Optional[FeatureBank] = bank
+        self.bank: Optional[DiskFeatureBank] = bank
         self.extractor = None
         self.ready = False
         self.error: Optional[str] = "starting"
@@ -222,22 +214,19 @@ class Engine:
         self.n_predictions = 0
         self.n_bad_images = 0
 
-    # ---------------------------------------------------------- loading
     def load(self) -> dict:
         """(Re)load model + bank. On failure, a previously working state keeps serving."""
         with self._load_lock:
             try:
                 new_ex, model_id, note = self._load_extractor()
                 if self.bank is None:
-                    self.bank = FeatureBank()
+                    self.bank = DiskFeatureBank(base_dir=BANK_DIR)
 
                 def validate(matrix: np.ndarray):
-                    # Refuse to install a model whose output size doesn't match the bank.
                     if matrix.shape[0] and matrix.shape[1] != new_ex.dim:
                         raise RuntimeError(
                             f"model outputs {new_ex.dim}-d vectors but the feature bank holds "
-                            f"{matrix.shape[1]}-d vectors - model and bank are out of sync "
-                            f"(retrain, or point at the right database)")
+                            f"{matrix.shape[1]}-d vectors - model and bank are out of sync")
 
                 def swap():
                     self.extractor = new_ex
@@ -247,7 +236,7 @@ class Engine:
                 self.ready, self.error, self.last_reload_error = True, None, None
                 self.loaded_at = time.time()
                 if n_vec == 0:
-                    note = (note + "; " if note else "") + "feature bank is empty - train first (POST /admin/train)"
+                    note = (note + "; " if note else "") + "feature bank is empty - train first"
                 log.info("loaded model %s, bank: %d vectors / %d species%s", model_id, n_vec, n_species,
                          f" ({note})" if note else "")
                 return {"vectors": n_vec, "species": n_species, "model": model_id, "note": note or None}
@@ -268,8 +257,7 @@ class Engine:
 
         if not pt_exists and not onnx_exists:
             raise FileNotFoundError(
-                f"no model found ({model_path} / {onnx_path}). Train one (POST /admin/train) "
-                f"or copy the trained files into place.")
+                f"no model found ({model_path} / {onnx_path}). Train one or copy the files into place.")
 
         need_export = False
         if pt_exists:
@@ -280,8 +268,7 @@ class Engine:
                 elif onnx_exists and state is None:
                     note = "ONNX has no sidecar, can't verify it matches the .pt"
                 else:
-                    raise RuntimeError(
-                        "the .onnx is missing or was exported from a different .pt, and AUTO_EXPORT_ONNX is off")
+                    raise RuntimeError("the .onnx is missing or was exported from a different .pt")
         else:
             note = "no .pt on disk - serving the .onnx unverified"
 
@@ -301,7 +288,7 @@ class Engine:
     def _export_onnx(self):
         log.info("exporting ONNX from %s (one-time, needs torch) ...", self.s.model_path)
         cmd = [sys.executable, "export_onnx.py", "--model", self.s.model_path, "--out", self.s.onnx_path]
-        env = child_env(DEBUG="1")  # train_model.py hides stderr unless DEBUG is set
+        env = child_env(DEBUG="1")
         try:
             r = subprocess.run(cmd, cwd=APP_DIR, env=env, capture_output=True, text=True,
                                timeout=self.s.export_timeout_s)
@@ -309,9 +296,8 @@ class Engine:
             raise RuntimeError("ONNX export timed out")
         if r.returncode != 0:
             tail = "\n".join((r.stdout + "\n" + r.stderr).strip().splitlines()[-8:])
-            raise RuntimeError(f"ONNX export failed (is torch installed? see requirements-train.txt):\n{tail}")
+            raise RuntimeError(f"ONNX export failed:\n{tail}")
 
-    # ---------------------------------------------------------- inference
     def snapshot(self):
         """(extractor, species_list, matrix, bank_version) - consistent with each other."""
         bank = self.bank
@@ -332,7 +318,6 @@ class Engine:
         winner = max(votes, key=lambda sp: (votes[sp], max(s for n, s in neighbors if n == sp)))
         score = max(s for n, s in neighbors if n == winner)
 
-        # trust a near-exact single match over the vote
         top_species, top_sim = neighbors[0]
         if top_species != winner and top_sim >= self.s.near_exact_sim:
             winner, score = top_species, top_sim
@@ -386,7 +371,6 @@ class Engine:
         vec = extractor.extract(im)
         return vec if float(np.linalg.norm(vec)) >= 1e-6 else None
 
-    # ---------------------------------------------------------- reporting
     @staticmethod
     def _pcts(values) -> dict:
         v = list(values)
@@ -425,6 +409,7 @@ class Engine:
             "bank_version": version,
             "bank_fingerprint": self._bank_fingerprint(species, matrix, version) if len(species) else None,
             "bank_backend": self.bank.backend if self.bank else None,
+            "bank_dir": BANK_DIR,
             "uptime_s": int(time.time() - self.started_at),
         }
 
@@ -458,19 +443,14 @@ class Trainer:
     def warnings(self) -> List[str]:
         w = []
         if not (APP_DIR / "Extra pokemons.zip").exists() and not (APP_DIR / "Extra pokemons").is_dir():
-            w.append("No 'Extra pokemons.zip' or 'Extra pokemons/' found: the extra species will be missing "
-                     "from the new model, and with REPLACE_DB_FEATURES=true they are removed from the bank.")
-        if not _env("POSTGRES_DSN") and not _env("PGHOST"):
-            w.append("Neither POSTGRES_DSN nor PGHOST is set: training will try libpq defaults and likely fail.")
+            w.append("No 'Extra pokemons.zip' or 'Extra pokemons/' found.")
         return w
 
     def start(self) -> dict:
         with self._lock:
             if self.state in ("running", "reloading"):
                 raise RuntimeError(f"a training run is already {self.state}")
-            env = child_env(DEBUG="1", PYTHONUNBUFFERED="1")  # DEBUG: keep tracebacks visible in the log
-            # stdout=PIPE (not the log file directly) so _pump_output can tee each line to
-            # both the log file and this server's own terminal, live, as it's produced.
+            env = child_env(DEBUG="1", PYTHONUNBUFFERED="1")
             self.proc = subprocess.Popen(self.s.trainer_cmd, cwd=APP_DIR, env=env,
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                          bufsize=1, text=True)
@@ -661,7 +641,7 @@ async def fetch_image(url: str, limit: int) -> bytes:
 
 
 # ============================================================ app factory
-def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] = None) -> FastAPI:
+def create_app(settings: Optional[Settings] = None, bank: Optional[DiskFeatureBank] = None) -> FastAPI:
     s = settings or Settings()
     engine = Engine(s, bank=bank)
     trainer = Trainer(s, engine)
@@ -670,9 +650,9 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         log.info(f"CPU cores={CORES}, onnx_threads={s.onnx_threads}, infer_slots={s.infer_concurrency}, "
-                 f"max_pending={s.max_pending}")
+                 f"max_pending={s.max_pending}, bank_dir={BANK_DIR}")
         if not s.api_key:
-            log.warning("API_KEY is not set: the API is OPEN to anyone who can reach it and /admin/* is disabled.")
+            log.warning("API_KEY is not set: the API is OPEN to anyone who can reach it.")
 
         async def _initial_load():
             try:
@@ -770,7 +750,7 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] 
             async with admitted(1):
                 results = await infer(engine.identify, [data])
         except EmptyBank:
-            raise HTTPException(503, "the feature bank is empty - train first (POST /admin/train)")
+            raise HTTPException(503, "the feature bank is empty - train first")
         if results[0] is None:
             raise HTTPException(422, "could not read that image")
         th = s.confidence_threshold if threshold is None else threshold
@@ -792,7 +772,7 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] 
                 parts = await asyncio.gather(*(infer(engine.identify, c) for c in chunks))
             results = [r for part in parts for r in part]
         except EmptyBank:
-            raise HTTPException(503, "the feature bank is empty - train first (POST /admin/train)")
+            raise HTTPException(503, "the feature bank is empty - train first")
         th = s.confidence_threshold if threshold is None else threshold
         return {"results": [
             {"ok": False, "error": "could not read that image"} if r is None
@@ -836,7 +816,7 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] 
                 try:
                     parts = await asyncio.gather(*(infer(engine.identify, c) for c in chunks))
                 except EmptyBank:
-                    raise HTTPException(503, "the feature bank is empty - train first (POST /admin/train)")
+                    raise HTTPException(503, "the feature bank is empty - train first")
                 results = [r for part in parts for r in part]
                 for (i, data, ms), r in zip(good, results):
                     if r is None:
@@ -880,6 +860,74 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] 
             "bank_version": engine.bank.version,
         }
 
+    @app.post("/v1/learn/batch", dependencies=[Depends(require_key)])
+    async def learn_batch(
+        species: List[str] = Form(...),
+        files: List[UploadFile] = File(...),
+        allow_new: bool = Form(True),
+    ):
+        """
+        Teach many examples in one request. Used by the bot's backfill mode.
+        Each (species[i], files[i]) pair becomes one learned example.
+
+        Returns a list of per-item results in the same order:
+            {"status": "learned"|"duplicate"|"unknown"|"bad_image", "species": str, "examples": int|None}
+        """
+        require_ready()
+        if len(species) != len(files):
+            raise HTTPException(422, f"species ({len(species)}) and files ({len(files)}) must be the same length")
+        if len(files) == 0:
+            raise HTTPException(422, "no items in batch")
+        if len(files) > 64:
+            raise HTTPException(413, "at most 64 items per batch")
+
+        # Read all uploads in parallel, then decode + embed in ONE ONNX call
+        blobs = list(await asyncio.gather(*(read_upload(f) for f in files)))
+        extractor = engine.extractor
+        if extractor is None:
+            raise HTTPException(503, "model not loaded")
+
+        # Decode PIL images here so the whole batch goes through one extract_batch.
+        pil: List[Optional[Image.Image]] = []
+        for b in blobs:
+            try:
+                pil.append(Image.open(io.BytesIO(b)).convert("RGB"))
+            except Exception:
+                pil.append(None)
+
+        # extract_batch returns zeros for unreadable images, so filter those out up-front.
+        valid_idx = [i for i, im in enumerate(pil) if im is not None]
+        vectors: List[Optional[np.ndarray]] = [None] * len(pil)
+        if valid_idx:
+            async with infer_sem:
+                vecs = await run_in_threadpool(extractor.extract_batch, [pil[i] for i in valid_idx])
+            for out_i, in_i in enumerate(valid_idx):
+                v = vecs[out_i]
+                if v is not None and float(np.linalg.norm(v)) >= 1e-6:
+                    vectors[in_i] = v
+
+        # Now apply the same learn() logic as the single endpoint, one item at a time,
+        # under the bank's own lock. Batched at the ONNX level, sequential at the file level.
+        results = []
+        for sp_name, vec in zip(species, vectors):
+            name = sp_name.strip()
+            if not name or len(name) > 64 or not species_key(name):
+                results.append({"status": "bad_image", "species": None, "examples": None})
+                continue
+            if vec is None:
+                results.append({"status": "bad_image", "species": None, "examples": None})
+                continue
+            try:
+                status, sp, extra = await run_in_threadpool(
+                    engine.bank.learn, name, vec, allow_new, s.learn_dup_sim
+                )
+            except Exception as e:
+                log.warning("learn_batch: item %r failed: %s", name, e)
+                status, sp, extra = "bad_image", None, None
+            results.append({"status": status, "species": sp, "examples": extra})
+
+        return {"results": results, "bank_version": engine.bank.version}
+
     @app.post("/v1/forget", dependencies=[Depends(require_key)])
     async def forget(body: ForgetBody):
         require_ready()
@@ -901,8 +949,9 @@ def create_app(settings: Optional[Settings] = None, bank: Optional[FeatureBank] 
             body["learned_vectors"] = await run_in_threadpool(engine.bank.count_learned)
         body["settings"] = {"top_k": s.top_k, "confidence_threshold": s.confidence_threshold,
                             "near_exact_sim": s.near_exact_sim, "learn_dup_sim": s.learn_dup_sim,
-                            "onnx_threads": s.onnx_threads, "infer_concurrency": s.infer_concurrency, "infer_chunk": s.infer_chunk,
-                            "cpu_cores": CORES, "pending_images": pending["n"], "max_pending": s.max_pending}
+                            "onnx_threads": s.onnx_threads, "infer_concurrency": s.infer_concurrency,
+                            "infer_chunk": s.infer_chunk, "cpu_cores": CORES, "pending_images": pending["n"],
+                            "max_pending": s.max_pending, "bank_dir": BANK_DIR}
         body["counters"] = {"predictions": engine.n_predictions, "unreadable_images": engine.n_bad_images}
         body["latency_ms"] = {"embed_per_image": engine._pcts(engine.m_embed), "match": engine._pcts(engine.m_match)}
         return body
@@ -947,9 +996,6 @@ if __name__ == "__main__":
     except ImportError:
         loop_impl = "asyncio"
         log.info("uvloop not installed - using the default asyncio loop (pip install uvloop for a bit more headroom)")
-    # Uvicorn's built-in per-request access log line is extra I/O on every single request;
-    # turn it off by default under load (your own app-level logs above are unaffected).
-    # Set UVICORN_ACCESS_LOG=1 to bring it back for debugging.
     access_log = _env_bool("UVICORN_ACCESS_LOG", False)
     uvicorn.run(app, host=_env("HOST", "0.0.0.0"), port=_env_int("PORT", 8000), log_level="info",
                 timeout_keep_alive=75, loop=loop_impl, access_log=access_log)
