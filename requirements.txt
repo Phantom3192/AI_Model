@@ -1,4 +1,4 @@
-# Serving the API needs only this (no torch): inference runs on ONNX Runtime.
+# Serving the API (no torch required for inference; ONNX Runtime only).
 fastapi>=0.110.0
 uvicorn>=0.29.0
 uvloop>=0.19.0 ; sys_platform != "win32"
@@ -7,7 +7,9 @@ numpy>=1.24.0
 Pillow>=10.0.0
 onnxruntime>=1.17.0
 python-dotenv>=1.0.0
-psycopg2-binary>=2.9.9
+aiohttp
+
+# Training (torch is only imported by the trainer subprocess and predict.py).
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch>=2.0.0
 torchvision>=0.15.0
@@ -17,4 +19,3 @@ huggingface_hub>=0.24.0
 onnx>=1.15.0
 rarfile>=4.0
 py7zr>=0.20.0
-aiohttp
